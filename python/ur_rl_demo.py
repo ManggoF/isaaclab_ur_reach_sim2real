@@ -29,7 +29,9 @@ class URONNXController(Node):
 
         # (2) Initialize UR transformations
         self.ur = UR()
-        self.ur.action_scales = [0.5, -0.5, 0.5, 0.5, 0.5, 0.5]
+        self.ur.action_scales *= 0.5
+        self.ur.action_offsets = [0.0, -1.712, 1.712, 0.0, 0.0, 0.0]
+        self.ur.position_offsets = [0.0, -1.712, 1.712, 0.0, 0.0, 0.0]
 
         self.num_joints = 6
 
@@ -117,19 +119,25 @@ class URONNXController(Node):
             self.target_pose,
             self.last_actions
         )
+        print("obs")
+        print(observation)
 
         # (8) Run inference via IsaacLab
         model_action = self.isaaclab.compute_action(observation)
 
+        print("model action")
+        print(model_action)
         # (9) Transform the model's action to Gazebo format
         desired_joints = self.ur.transform_action_to_gazebo(model_action)
-
+        
+        print("desired joints")
+        print(desired_joints)
         # (10) Publish joint commands
         cmd_msg = Float64MultiArray()
         cmd_msg.data = desired_joints.tolist()
         self.joint_cmd_pub.publish(cmd_msg)
 
-        self.get_logger().info(f"Publishing joint command: {desired_joints}")
+        # self.get_logger().info(f"Publishing joint command: {desired_joints}")
 
         # (11) Update last_actions
         self.last_actions = model_action # desired_joints.astype(np.float32)
