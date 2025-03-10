@@ -16,7 +16,7 @@ This repository provides a ROS2-based control framework for Universal Robots usi
 1. **Clone the repository:**
 
    ```bash
-   git clone <your-repo-url>
+   https://github.com/louislelay/ur_onnx_controller.git
    cd ur_onnx_control
    ```
 
@@ -46,7 +46,7 @@ Open a second terminal.
 - Send test commands:
 
   ```bash
-  ros2 topic pub /forward_position_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
+  ros2 topic pub --once /forward_position_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.0, -1.5568, 1.5698, 0.0, 0.0, 0.0]}"
   ```
 
 - Test the positional demo:
@@ -78,10 +78,10 @@ pose:
     y: 0.0
     z: 0.2
   orientation:
-    x: 0.0
+    x: 0.7071
     y: 0.0
-    z: 0.0
-    w: 1.0
+    z: 0.7071
+    w: 0.0
 "
 ```
 
