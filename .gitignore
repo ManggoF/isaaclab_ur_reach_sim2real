@@ -1,1 +1,6 @@
 ur_ws/
+
+ur/__pycache__
+isaaclab/__pycache__
+
+*.pyc
