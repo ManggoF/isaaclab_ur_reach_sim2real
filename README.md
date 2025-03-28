@@ -1,122 +1,126 @@
-# ur_onnx_controller
 
-This repository provides a ROS2-based control framework for Universal Robots using an ONNX policy model. It integrates the UR controller with a Gazebo simulation environment. The setup has been tested with ROS2 Humble, and it should also work with ROS2 Foxy.
+# UR10 Sim2Real Transfer Package
 
-> **Note:** This project is still a work in progress. Policy testing is working but exhibit unexpected behavior.
+This repository uses a UR10 Reach task trained policy using Isaac Lab to do sim-to-real transfer. It has been tested with ROS2 Humble on Ubuntu 22.04.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Sim2Sim Setup](#sim2sim-setup)
+  - [Sim2Real Setup](#sim2real-setup)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+## Overview
+
+This repository provides a framework to test a pretrained UR10 policy in simulation using URSim (sim2sim) and then transfer it to a real robot (sim2real). The simulation is based on the `ur_robot_driver` package. A pretrained policy is available in the `sample` directory. Note that you need to adjust the policy path in `ur.py`.
 
 ## Prerequisites
 
-- **ROS2** (tested on Humble; Foxy support is expected)
-  - **UR Controller**
-  - **UR Simulation in Gazebo**
-- **Python** (with the onnx package installed)
+- **Operating System:** Ubuntu 22.04
+- **ROS 2:** Humble Hawksbill  
+  [Installation guide](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html)
+- **UR Robot Driver:** [ur_robot_driver](https://github.com/UniversalRobots/Universal_Robots_ROS2_Driver)
+- **Python:** Python 3
 
 ## Installation
 
-1. **Clone the repository:**
+1. **Install ROS 2 Humble:**  
+   Follow the [ROS 2 installation guide](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html).
 
+2. **Install the UR Robot Driver Package:**  
    ```bash
-   https://github.com/louislelay/ur_onnx_controller.git
-   cd ur_onnx_control
+   sudo apt update
+   sudo apt install ros-humble-ur-robot-driver
    ```
 
-2. **Source your ROS2 setup and other necessary environments:**
-
+3. **Clone the Repository:**
    ```bash
-   cd repo-path/
-   source /opt/ros/<distro>/setup.bash
+   git clone https://github.com/louislelay/isaaclab_ur_reach_sim2real.git
    ```
 
-## Launching the Simulation and Controller
+## Usage
 
-### 1. Launch the Simulation
+### Sim2Sim Setup
 
-Open a terminal and run:
+Follow these steps to run the simulation:
 
-```bash
-ros2 launch ur_simulation_gazebo ur_sim_control.launch.py initial_joint_controller:=forward_position_controller
-```
+1. **Launch URSim:**
 
-### 2. Test the Forward Position Controller
+   Open a terminal and run:
+   ```bash
+   ros2 run ur_robot_driver start_ursim.sh -m ur10e
+   ```
+   This will launch URSim at http://192.168.56.101:6080/vnc.html. Click **Connect** and you should see an interface similar to:
 
-Open a second terminal.
+   ![URSim Interface](medias/ursim_interface_image.png)
 
-*Tests:*
+2. **Activate External Control in URCaps:**
 
-- Send test commands:
+   - In the **Programs** tab, below **URCaps**, click on **External Control**. You should see appear below **Robot Progam** : **Control by 192.168.56.1**
 
-  ```bash
-  ros2 topic pub --once /forward_position_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.0, -1.5568, 1.5698, 0.0, 0.0, 0.0]}"
-  ```
+     ![URCaps Interface](medias/urcaps_image.png)
 
-- Test the positional demo:
+   - Click on the red button in the bottom left. Click on **On**, then **Start** until the following interface appears:
+     
+     ![Robot Started Interface](medias/robot_started_image.png)
 
-  ```bash
-  python3 python/ur_pos_demo.py
-  ```
+3. **Exit URCaps and Proceed:**
 
-Try out the reinforcement learning (policy) demo:
+   - Press **Exit** in URCaps.
+   - Switch to the **Move** tab in the interface:
+     
+     ![Next Tab Interface](medias/move_tab_image.png)
 
-```bash
-python3 python/ur_rl_demo.py
-```
+4. **Connect the interface to the computer:**
 
-### 3. Send a Target Pose Command
+   - Press the play button in the bottom.
+   - Select the **Control by 192.168...** option in the interface:
+     
+     ![Connect Interface](medias/play_selection_image.png)
 
-Open a third terminal and publish a target pose:
+5. **Launch Robot Control:**
 
-```bash
-ros2 topic pub /target_pose geometry_msgs/PoseStamped "
-header:
-  stamp:
-    sec: 0
-    nanosec: 0
-  frame_id: 'base_link'
-pose:
-  position:
-    x: 0.5
-    y: 0.0
-    z: 0.2
-  orientation:
-    x: 0.7071
-    y: 0.0
-    z: 0.7071
-    w: 0.0
-"
-```
+   In another terminal, run:
+   ```bash
+   ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.56.101
+   ```
 
-## Policy ONNX Model Details
+6. **Run the Task Script:**
 
-The ONNX policy model for the UR10 has the following input and output specifications:
+   Navigate to the Python directory within the repository:
+   ```bash
+   cd <path_to_repository>/isaaclab_ur_reach_sim2real/python
+   ```
+   **Note:** Ensure that the policy path in `ur.py` is updated to point to your pretrained policy (available in the `samples` directory, if needed).
 
-- **Input:**
-  - **Name:** `obs`
-  - **Shape:** `[1, 25]`
+   Finally, run:
+   ```bash
+   python3 run_task.py
+   ```
+   The robot’s end effector should move to the target pose specified in the script.
 
-- **Output:**
-  - **Name:** `actions`
-  - **Shape:** `[1, 6]`
+7. **Demonstration Video:**
 
-## How to Retrieve ONNX Model Information
+   [![Demonstration video](https://img.youtube.com/vi/B4jCdmKzhKA/0.jpg)](https://www.youtube.com/watch?v=B4jCdmKzhKA)
 
-To inspect the input and output details of the ONNX model (`policy.onnx`), navigate to the model’s directory and run the following Python script:
+### Sim2Real Setup
 
-```python
-import onnx
+This section is a work in progress (WIP).
 
-# Load the ONNX model
-model_path = "policy.onnx"
-model = onnx.load(model_path)
+## Notes
 
-# Get the input details
-print("Input details:")
-for input_tensor in model.graph.input:
-    shape = [dim.dim_value if dim.dim_value > 0 else 'dynamic' for dim in input_tensor.type.tensor_type.shape.dim]
-    print(f"Name: {input_tensor.name}, Shape: {shape}")
+Acknowledgments
 
-# Get the output details
-print("\nOutput details:")
-for output_tensor in model.graph.output:
-    shape = [dim.dim_value if dim.dim_value > 0 else 'dynamic' for dim in output_tensor.type.tensor_type.shape.dim]
-    print(f"Name: {output_tensor.name}, Shape: {shape}")
-```
+- **[Johnson Sun](https://github.com/j3soon)**: Many thanks for his valuable advice and time.
+- **UR10Reacher Sim2Real for Isaac Gym:** [UR10Reacher repository](https://github.com/j3soon/OmniIsaacGymEnvs-UR10Reacher)
+- **Isaac Lab:** [Isaac Lab repository](https://github.com/isaac-sim/IsaacLab)
+- **UR Robot Driver:** [UR Robot Driver repository](https://github.com/UniversalRobots/Universal_Robots_ROS2_Driver)
+- **ROS 2 Community:** [ROS 2 project](https://docs.ros.org/en/humble/index.html)
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
