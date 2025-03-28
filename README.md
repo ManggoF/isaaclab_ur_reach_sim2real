@@ -60,42 +60,44 @@ Follow these steps to run the simulation:
 
 2. **Activate External Control in URCaps:**
 
-   - In the **Programs** tab, below **URCaps**, click on **External Control**. You should see appear below **Robot Progam** : **Control by 192.168.56.1**
+   In the **Programs** tab, below **URCaps**, click on **External Control**. Below **Robot Progam** you should see appear  : **Control by 192.168.56.1**
 
-     ![URCaps Interface](medias/urcaps_image.png)
+   ![URCaps Interface](medias/urcaps_image.png)
 
-   - Click on the red button in the bottom left. Click on **On**, then **Start** until the following interface appears:
+3. **Start the UR Robot**
+
+   Click on the red button in the bottom left. Click on **On**, then **Start** until you obtain the following interface:
      
-     ![Robot Started Interface](medias/robot_started_image.png)
+   ![Robot Started Interface](medias/robot_started_image.png)
 
-3. **Exit URCaps and Proceed:**
+4. **Exit and Proceed:**
 
-   - Press **Exit** in URCaps.
+   - Press **Exit**.
    - Switch to the **Move** tab in the interface:
      
      ![Next Tab Interface](medias/move_tab_image.png)
 
-4. **Connect the interface to the computer:**
+5. **Connect the interface to the computer:**
 
    - Press the play button in the bottom.
    - Select the **Control by 192.168...** option in the interface:
      
      ![Connect Interface](medias/play_selection_image.png)
 
-5. **Launch Robot Control:**
+6. **Launch Robot Control:**
 
    In another terminal, run:
    ```bash
    ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.56.101
    ```
 
-6. **Run the Task Script:**
+7. **Run the Task Script:**
 
    Navigate to the Python directory within the repository:
    ```bash
    cd <path_to_repository>/isaaclab_ur_reach_sim2real/python
    ```
-   **Note:** Ensure that the policy path in `ur.py` is updated to point to your pretrained policy (available in the `samples` directory, if needed).
+   **Note:** Ensure that the policy path in `ur.py` is updated to point to your pretrained policy (one is available in the `sample` directory if needed).
 
    Finally, run:
    ```bash
@@ -103,9 +105,9 @@ Follow these steps to run the simulation:
    ```
    The robot’s end effector should move to the target pose specified in the script.
 
-7. **Demonstration Video:**
+8. **Demonstration Video:**
 
-   Click on it to go to the youtube video.
+   Click on it to go to the youtube video and see the result.
 
    [![Demonstration video](https://img.youtube.com/vi/B4jCdmKzhKA/0.jpg)](https://www.youtube.com/watch?v=B4jCdmKzhKA)
 
@@ -113,9 +115,7 @@ Follow these steps to run the simulation:
 
 This section is a work in progress (WIP).
 
-## Notes
-
-Acknowledgments
+## Acknowledgments
 
 - **[Johnson Sun](https://github.com/j3soon)**: Many thanks for his valuable advice and time.
 - **UR10Reacher Sim2Real for Isaac Gym:** [UR10Reacher repository](https://github.com/j3soon/OmniIsaacGymEnvs-UR10Reacher)
