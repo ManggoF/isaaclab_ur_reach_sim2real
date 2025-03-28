@@ -1,5 +1,5 @@
 
-# UR10 Reach Task from Isaac Lab Sim2Real Transer 
+# UR10 Reach Task from Isaac Lab Sim2Real Transfer 
 
 This repository uses a UR10 Reach task trained policy using Isaac Lab to do sim-to-real transfer. It has been tested with ROS2 Humble on Ubuntu 22.04.
 
