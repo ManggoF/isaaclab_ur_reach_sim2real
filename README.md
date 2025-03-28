@@ -105,6 +105,8 @@ Follow these steps to run the simulation:
 
 7. **Demonstration Video:**
 
+   Click on it to go to the youtube video.
+   
    [![Demonstration video](https://img.youtube.com/vi/B4jCdmKzhKA/0.jpg)](https://www.youtube.com/watch?v=B4jCdmKzhKA)
 
 ### Sim2Real Setup
