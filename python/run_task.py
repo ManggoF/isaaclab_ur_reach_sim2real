@@ -119,7 +119,7 @@ class ReachPolicy(Node):
                 f"Simulation joint {index} angle ({angle_deg}) out of range [{L}, {U}]. Clipping."
             )
             angle_deg = np.clip(angle_deg, L, U)
-        # Map the angle from the simulation range to the servo range
+        # Map the angle from the simulation range to the servo range 相当于又映射回了弧度rad
         mapped = (angle_deg - L) * ((B - A) / (U - L)) + A
         if inversed:
             mapped = (B - A) - (mapped - A) + A
