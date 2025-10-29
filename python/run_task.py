@@ -35,7 +35,7 @@ class ReachPolicy(Node):
     ]
     
     # ROS topics and joint names
-    STATE_TOPIC = '/scaled_joint_trajectory_controller/state'
+    STATE_TOPIC = '/scaled_joint_trajectory_controller/controller_state'
     CMD_TOPIC = '/scaled_joint_trajectory_controller/joint_trajectory'
     JOINT_NAMES = [
         'elbow_joint',
@@ -81,7 +81,7 @@ class ReachPolicy(Node):
         
         # Publisher for joint trajectory commands
         self.pub = self.create_publisher(JointTrajectory, self.CMD_TOPIC, 10)
-        self.min_traj_dur = 0  # Minimum trajectory duration in seconds
+        self.min_traj_dur = 0.01  # Minimum trajectory duration in seconds 至少给控制器一个完整的控制周期去执行动作 控制循环周期是 self.step_size = 0.01 (100 Hz)
         
         self.get_logger().info("ReachPolicy node initialized.")
 
@@ -92,12 +92,12 @@ class ReachPolicy(Node):
         """
         actual_pos = {}
         for i, joint_name in enumerate(msg.joint_names):
-            joint_pos = msg.actual.positions[i]
+            joint_pos = msg.reference.positions[i]
             actual_pos[joint_name] = joint_pos
         self.current_pos = actual_pos
         
         # Update the robot's state with current joint positions and velocities.
-        self.robot.update_joint_state(msg.actual.positions, msg.actual.velocities)
+        self.robot.update_joint_state(msg.reference.positions, msg.reference.velocities)
 
     def map_joint_angle(self, pos: float, index: int) -> float:
         """
@@ -135,8 +135,9 @@ class ReachPolicy(Node):
         Timer callback to compute and publish the next joint trajectory command.
         """
         # Set a constant target command for the robot (example values)
-        self.target_command = np.array([0.5, 0.0, 0.2, 0.7071, 0.0, 0.7071, 0.0])
-        
+        # self.target_command = np.array([0.5, 0.0, 0.2, 0.7071, 0.0, 0.7071, 0.0])
+        self.target_command = np.array([0.5, 0.4, 0.3, 0.7071, 0.7071, 0.0, 0.0]) # x, y, z, qw, qx, qy, qz 存疑的
+
         # Get simulation joint positions from the robot's forward model
         joint_pos = self.robot.forward(self.step_size, self.target_command)
         
