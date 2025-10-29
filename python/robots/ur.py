@@ -8,6 +8,7 @@ class URReachPolicy(PolicyController):
     def __init__(self) -> None:
         """Initialize the URReachPolicy instance."""
         super().__init__()
+        self.current_tcp_position = np.zeros(3) # 新增一个变量来存储TCP位置
         self.dof_names = [
             "shoulder_pan_joint",
             "shoulder_lift_joint",
@@ -31,6 +32,10 @@ class URReachPolicy(PolicyController):
         self.has_joint_data = False
         self.current_joint_positions = np.zeros(6)
         self.current_joint_velocities = np.zeros(6)
+
+    def update_tcp_position(self, tcp_position: np.ndarray) -> None:
+        """从外部更新TCP的位置"""
+        self.current_tcp_position = tcp_position
 
     def update_joint_state(self, position, velocity) -> None:
         """
@@ -59,8 +64,8 @@ class URReachPolicy(PolicyController):
         obs = np.zeros(28)
         obs[:6] = self.current_joint_positions - self.default_pos   #调试看看和仿真里能不能对应上
         obs[6:12] = self.current_joint_velocities
-        obs[12:19] = command
-        ball_position = command[:3] #TODO：用机械臂末端位置TCP作为小球位置吧
+        # 使用我们刚刚更新的、真实的TCP位置！
+        ball_position = self.current_tcp_position
         obs[19:22] = ball_position
         obs[22:28] = self._previous_action
         return obs

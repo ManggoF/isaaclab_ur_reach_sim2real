@@ -8,7 +8,10 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 from robots.ur import URReachPolicy
-
+from rclpy.duration import Duration as RclpyDuration # 避免和消息重名
+import tf2_ros
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 
 class ReachPolicy(Node):
     """ROS2 node for controlling a UR robot's reach policy."""
@@ -59,6 +62,13 @@ class ReachPolicy(Node):
     def __init__(self, fail_quietly: bool = False, verbose: bool = False):
         """Initialize the ReachPolicy node."""
         super().__init__('reach_policy_node')
+
+          # ==================== TF2 初始化 ====================
+        # 1. 创建一个 TF 缓冲区，它会接收并缓存 TF 监听器收到的变换关系
+        self.tf_buffer = Buffer()
+        # 2. 创建一个 TF 监听器，它会订阅 TF 话题并将数据填充到缓冲区
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # ======================================================
         
         self.robot = URReachPolicy()
         self.target_command = np.zeros(7)
@@ -134,6 +144,46 @@ class ReachPolicy(Node):
         """
         Timer callback to compute and publish the next joint trajectory command.
         """
+
+         # ==================== 新增：获取TCP位置 ====================
+        target_frame = 'base_link'
+        source_frame = 'tool0'
+        
+        # 使用 can_transform 来检查，而不是直接尝试 lookup_transform
+        if not self.tf_buffer.can_transform(target_frame, source_frame, rclpy.time.Time(), timeout=RclpyDuration(seconds=0.1)):
+            self.get_logger().info(
+                f'Waiting for transform from {source_frame} to {target_frame}...',
+                throttle_duration_sec=1.0 # 每秒最多打印一次这条信息，避免刷屏
+            )
+            return # 如果变换不可用，直接返回，等待下一次回调
+
+        try:
+            # 既然已经检查过，这里的 lookup_transform 几乎总能成功
+            now = rclpy.time.Time()
+            trans = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                now
+                # 注意：因为 can_transform 已经包含了超时等待，这里的 timeout 可以省略
+            )
+            
+            # 从变换中提取XYZ位置
+            tcp_position = np.array([
+                trans.transform.translation.x,
+                trans.transform.translation.y,
+                trans.transform.translation.z
+            ])
+
+            # 将TCP位置传递给您的策略模型
+            self.robot.update_tcp_position(tcp_position)
+
+        except tf2_ros.TransformException as ex:
+            # 尽管我们已经检查过，但以防万一还是保留异常处理
+            self.get_logger().warn(
+                f'Could not transform {target_frame} to {source_frame}: {ex}')
+            return
+        # ===========================================================
+        
         # Set a constant target command for the robot (example values)
         # self.target_command = np.array([0.5, 0.0, 0.2, 0.7071, 0.0, 0.7071, 0.0])
         self.target_command = np.array([0.5, 0.4, 0.3, 0.7071, 0.7071, 0.0, 0.0]) # x, y, z, qw, qx, qy, qz 存疑的
@@ -147,9 +197,6 @@ class ReachPolicy(Node):
             
             target_pos = [0] * 6
             for i, pos in enumerate(joint_pos):
-                # Skip gripper joints for this task (assuming index 5 is gripper)
-                if i == 5:
-                    continue
                 target_pos[i] = self.map_joint_angle(pos, i)
             self.target_pos = target_pos
             
