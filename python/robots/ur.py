@@ -20,7 +20,7 @@ class URReachPolicy(PolicyController):
         # Load the pre-trained policy model and environment configuration
         # YOU NEED TO CHANGE THE PATH
         self.load_policy(
-            "/home/xry/isaaclab_ur_reach_sim2real/sample/ur_reach/ur5_reach_policy.pt",
+            "/home/xry/isaaclab_ur_reach_sim2real/sample/ur_reach/model_1499_export.pt",
             "/home/xry/isaaclab_ur_reach_sim2real/sample/ur_reach/ur_reach_env.yaml",
         )
 
