@@ -8,10 +8,10 @@ import os
 
 # 1. 输入: 您训练好的检查点文件的完整路径
 #    (请将其替换为您自己的文件路径)
-CHECKPOINT_PATH = "/home/xry/isaaclab_ur_reach_sim2real/sample/ur_reach/model.pt"
+CHECKPOINT_PATH = "/home/xry/isaaclab_ur_reach_sim2real/sample/ur_reach/model_random_1499.pt"
 
 # 2. 输出: 您想要保存的 TorchScript 模型的路径和文件名
-EXPORT_PATH = "ur5_reach_policy.pt"
+EXPORT_PATH = "ur5_random_1499.pt"
 
 # 3. 环境参数 (*** 您必须根据您的环境填写这些值 ***)
 #    - 您可以在您的任务配置文件中找到它们 (例如 ur5_reach_cfg.py)
@@ -19,8 +19,8 @@ NUM_OBS = 28  # <--- !! 请在此处填写正确的观察空间维度 !!
 NUM_ACTIONS = 6  # <--- !! 请在此处填写正确的动作空间维度 (UR5通常是6) !!
 
 # 4. 模型架构参数 (从您的 UR5ReachPPORunnerCfg 文件中提取)
-ACTOR_HIDDEN_DIMS = [64, 64]
-CRITIC_HIDDEN_DIMS = [64, 64]
+ACTOR_HIDDEN_DIMS = [128, 128, 64]
+CRITIC_HIDDEN_DIMS = [128, 128, 64]
 ACTIVATION = "elu"
 INIT_NOISE_STD = 1.0
 
