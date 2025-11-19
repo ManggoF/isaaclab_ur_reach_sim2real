@@ -7,13 +7,13 @@ import math
 # --- ROS2 和 转换库 ---
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import PoseStamped # <<-- 修改这里
 from scipy.spatial.transform import Rotation as R
 
 class FacePosePublisher(Node):
     def __init__(self):
         super().__init__('face_pose_publisher')
-        self.publisher_ = self.create_publisher(Pose, '/face_pose', 10)
+        self.publisher_ = self.create_publisher(PoseStamped, '/face_pose', 10)
         
         # --- 1. 初始化模块 ---
         self.init_realsense()
@@ -113,24 +113,31 @@ class FacePosePublisher(Node):
                             self.intr, [mouth_center_2d[0], mouth_center_2d[1]], depth
                         )
                         
-                        # --- 步骤 3: 组合精确位置和姿态，并进行坐标变换 ---
-                        pos_x, pos_y, pos_z, quat = self.transform_hybrid_pose_to_robot_frame(
-                            rotation_vector, pos_in_camera_frame
-                        )
+                    # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
+                        pose_msg = PoseStamped()
+                        # 关键：设置消息头，指明这个位姿是相对于哪个坐标系的
+                        pose_msg.header.stamp = self.get_clock().now().to_msg()
+                        pose_msg.header.frame_id = 'camera_color_optical_frame'
+                        
+                        # 填充位置 (直接使用相机反投影得到的值)
+                        pose_msg.pose.position.x = pos_in_camera_frame[0]
+                        pose_msg.pose.position.y = pos_in_camera_frame[1]
+                        pose_msg.pose.position.z = pos_in_camera_frame[2]
+                        
+                        # 填充姿态 (仅从旋转向量转为四元数)
+                        r = R.from_rotvec(rotation_vector.flatten())
+                        quat = r.as_quat() # [x, y, z, w]
+                        
+                        pose_msg.pose.orientation.x = quat[0]
+                        pose_msg.pose.orientation.y = quat[1]
+                        pose_msg.pose.orientation.z = quat[2]
+                        pose_msg.pose.orientation.w = quat[3]
                         
                         # --- 步骤 4: 发布最终的位姿指令 ---
-                        pose_msg = Pose()
-                        pose_msg.position.x = pos_x
-                        pose_msg.position.y = pos_y
-                        pose_msg.position.z = pos_z
-                        # 保持正确的 [x, y, z, w] 顺序
-                        pose_msg.orientation.x = quat[0]
-                        pose_msg.orientation.y = quat[1]
-                        pose_msg.orientation.z = quat[2]
-                        pose_msg.orientation.w = quat[3]
-                        
                         self.publisher_.publish(pose_msg)
-                        self.get_logger().info(f'发布位姿: Pos(x={pos_x:.2f}, y={pos_y:.2f}, z={pos_z:.2f}) Quat(x={quat[0]:.2f}, y={quat[1]:.2f}, z={quat[2]:.2f}, w={quat[3]:.2f})')
+                        # 日志可以简化或保留相机坐标系下的值
+                        self.get_logger().info(f'发布相机坐标系下的位姿: Pos(x={pos_in_camera_frame[0]:.2f}) y={pos_in_camera_frame[1]:.2f} z={pos_in_camera_frame[2]:.2f}), ')
+                        
 
                     # --- 可视化部分 (仍然使用旧数据来保证显示正确性) ---
                     mouth_3d_coords_cm = np.array(pos_in_camera_frame) * 100 if depth > 0 else None
@@ -144,25 +151,6 @@ class FacePosePublisher(Node):
             
             rclpy.spin_once(self, timeout_sec=0.001)
 
-    def transform_hybrid_pose_to_robot_frame(self, rvec, pos_cam):
-        """
-        将混合位姿(solvePnP的姿态 + 深度相机的位置)转换为ROS机器人坐标系。
-        :param rvec:来自 solvePnP 的旋转向量。
-        :param pos_cam:来自深度相机反投影的3D位置向量 [x, y, z] (单位: 米)。
-        """
-        # --- 位置变换 ---
-        # 坐标系映射: Camera(X右,Y下,Z前) -> ROS(X前,Y左,Z上)
-        pos_x =  pos_cam[2]
-        pos_y = -pos_cam[0]
-        pos_z = -pos_cam[1]
-        
-        # --- 姿态变换 (与之前相同) ---
-        r = R.from_rotvec(rvec.flatten())
-        cam_to_robot_rotation = R.from_euler('zx', [-90, -90], degrees=True)
-        final_rotation = r * cam_to_robot_rotation
-        quat = final_rotation.as_quat() # [x, y, z, w]
-        
-        return pos_x, pos_y, pos_z, quat
 
     def visualize_all_info(self, image, rvec, tvec, mouth_center_2d, mouth_3d_coords_cm):
         """在图像上绘制所有需要的信息"""

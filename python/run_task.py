@@ -6,13 +6,14 @@ import math
 from control_msgs.msg import JointTrajectoryControllerState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Pose 
+from geometry_msgs.msg import PoseStamped 
 
 from robots.ur import URReachPolicy
 from rclpy.duration import Duration as RclpyDuration
 import tf2_ros
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+import tf2_geometry_msgs # <<-- 非常重要，用于自动变换PoseStamped
 
 class ReachPolicy(Node):
     SIM_DOF_ANGLE_LIMITS = [(-360, 360, False), (-360, 360, False), (-360, 360, False), (-360, 360, False), (-360, 360, False), (-360, 360, False)]
@@ -44,7 +45,7 @@ class ReachPolicy(Node):
         )
         
         self.face_pose_subscriber = self.create_subscription(
-            Pose, '/face_pose', self.face_pose_callback, 10
+            PoseStamped, '/face_pose', self.face_pose_callback, 10
         )
         
         self.pub = self.create_publisher(JointTrajectory, self.CMD_TOPIC, 10)
@@ -52,18 +53,40 @@ class ReachPolicy(Node):
         
         self.get_logger().info("ReachPolicy节点已初始化, 等待人脸位姿目标...")
 
-    def face_pose_callback(self, msg: Pose):
+    def face_pose_callback(self, msg: PoseStamped):
         if not self.target_received:
             self.get_logger().info("已接收到第一个人脸位姿目标，机器人开始运动。")
             self.target_received = True
 
-        pos = msg.position
-        ori = msg.orientation
+        target_frame = 'base_link'
 
-        self.target_command = np.array([
-            pos.x, pos.y, pos.z,
-            ori.x, ori.y, ori.z, ori.w
-        ])
+        try:
+            # --- 核心：使用TF2进行坐标变换 ---
+            transformed_pose_stamped = self.tf_buffer.transform(
+                msg,
+                target_frame,
+                timeout=RclpyDuration(seconds=0.1)
+            )
+            
+            # 从变换后的位姿中提取位置和方向
+            pos = transformed_pose_stamped.pose.position
+            ori = transformed_pose_stamped.pose.orientation
+
+            self.target_command = np.array([
+                pos.x, pos.y, pos.z,
+                ori.x, ori.y, ori.z, ori.w
+            ])
+
+            # <<< 在这里添加新的日志打印行 <<<
+            self.get_logger().info(
+                f"转换后目标指令 ({target_frame}): "
+                f"Pos(x={self.target_command[0]:.3f}, y={self.target_command[1]:.3f}, z={self.target_command[2]:.3f})"
+                f"Ori(x={self.target_command[3]:.3f}, y={self.target_command[4]:.3f}, z={self.target_command[5]:.3f}, w={self.target_command[6]:.3f})"
+            )
+            
+        except tf2_ros.TransformException as ex:
+            self.get_logger().warn(f'无法将位姿从 {msg.header.frame_id} 变换到 {target_frame}: {ex}', throttle_duration_sec=1.0)
+            return
     
     # ... (其余方法保持不变) ...
     def sub_callback(self, msg: JointTrajectoryControllerState):
