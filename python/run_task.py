@@ -92,7 +92,7 @@ class ReachPolicy(Node):
     def sub_callback(self, msg: JointTrajectoryControllerState):
         actual_pos = {}
         for i, joint_name in enumerate(msg.joint_names):
-            joint_pos = msg.reference.positions[i]
+            joint_pos = msg.reference.positions[i] # joint_pos = msg.actual.positions[i] 22.04
             actual_pos[joint_name] = joint_pos
         self.current_pos = actual_pos
         self.robot.update_joint_state(msg.reference.positions, msg.reference.velocities)
