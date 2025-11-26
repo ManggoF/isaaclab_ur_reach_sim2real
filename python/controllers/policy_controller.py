@@ -1,9 +1,13 @@
 import io
+import os
 from typing import Optional
 import numpy as np
 import torch
 
 from utils.config_loader import parse_env_config, get_physics_properties, get_robot_joint_properties
+
+# 定义归一化统计文件路径 (你需要根据实际部署路径设置)
+DEPLOY_STATS_DIR = "/home/xry/isaaclab_ur_reach_sim2real/sample/ur_reach/"
 
 class PolicyController:
     """
@@ -11,12 +15,15 @@ class PolicyController:
     """
 
     def __init__(self) -> None:
+        self.obs_mean: Optional[np.ndarray] = None
+        self.obs_std: Optional[np.ndarray] = None
         pass
 
     def load_policy(self, policy_file_path, policy_env_path) -> None:
         """
         Loads policy from a file.
         """
+        # --- 1. 加载策略模型 ---
         print("\n=== Policy Loading ===")
         print(f"{'Model path:':<18} {policy_file_path}")
         print(f"{'Environment path:':<18} {policy_env_path}")
@@ -24,6 +31,9 @@ class PolicyController:
         with open(policy_file_path, "rb") as f:
             file = io.BytesIO(f.read())
         self.policy = torch.jit.load(file)
+
+        # --- 2. 加载环境配置 ---
+
         self.policy_env_params = parse_env_config(policy_env_path)
 
         self._decimation, self._dt, self.render_interval = get_physics_properties(self.policy_env_params)
@@ -47,6 +57,21 @@ class PolicyController:
         print(f"{'Default position:':<18} {self.default_pos}")
         print(f"{'Default velocity:':<18} {self.default_vel}")
 
+        # --- 3. 加载归一化统计量 (新增) ---
+        mean_path = os.path.join(DEPLOY_STATS_DIR, 'obs_mean.npy')
+        std_path = os.path.join(DEPLOY_STATS_DIR, 'obs_std.npy')
+
+        try:
+            self.obs_mean = np.load(mean_path).astype(np.float32)
+            self.obs_std = np.load(std_path).astype(np.float32)
+            
+            # 避免除以零，将过小的标准差设为1.0
+            self.obs_std[np.where(self.obs_std == 0)] = 1.0 
+            
+            print(f"\n✅ Normalization stats loaded. Dim: {self.obs_mean.shape[0]}")
+        except Exception as e:
+            print(f"\n❌ ERROR: Failed to load normalization stats from {DEPLOY_STATS_DIR}. {e}")
+            raise RuntimeError("Missing or corrupt normalization files.")
         print("\n=== Policy Loaded ===\n")
 
     def _compute_action(self, obs: np.ndarray) -> np.ndarray:
@@ -59,8 +84,13 @@ class PolicyController:
         Returns:
             np.ndarray: The action.
         """
+        if self.obs_mean is None or self.obs_std is None:
+            raise RuntimeError("Normalization stats not loaded before computing action.")
+            
+        # --- 归一化 (新增) ---
+        obs_norm = (obs - self.obs_mean) / self.obs_std
         with torch.no_grad():
-            obs = torch.from_numpy(obs).view(1, -1).float()
+            obs = torch.from_numpy(obs_norm).view(1, -1).float()
             action = self.policy(obs).detach().view(-1).numpy()
         return action
 

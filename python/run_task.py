@@ -109,20 +109,6 @@ class ReachPolicy(Node):
     def step_callback(self):
         if not self.target_received:
             return
-
-        # target_frame = 'base_link'
-        # source_frame = 'tool0'
-        # if self.tf_buffer.can_transform(target_frame, source_frame, rclpy.time.Time(), timeout=RclpyDuration(seconds=0.1)):
-        #     try:
-        #         trans = self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time())
-        #         tcp_position = np.array([trans.transform.translation.x, trans.transform.translation.y, trans.transform.translation.z])
-        #         self.robot.update_tcp_position(tcp_position)
-        #     except tf2_ros.TransformException as ex:
-        #         self.get_logger().warn(f'无法获取TF变换: {ex}')
-        #         return
-        # else:
-        #     self.get_logger().info(f'等待从 {source_frame} 到 {target_frame} 的TF变换...', throttle_duration_sec=1.0)
-        #     return
         
         joint_pos = self.robot.forward(self.step_size, self.target_command)
         
