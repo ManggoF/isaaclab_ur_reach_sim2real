@@ -103,7 +103,7 @@ class URReachPolicy(PolicyController):
             # print(f"{'Raw Action:':<20} {np.round(self.action, 4)}")
             # processed_action = self.default_pos + (self.action * self._action_scale)
             # print(f"{'Processed Action:':<20} {np.round(processed_action, 4)}")
-
+        # 核心：动作反归一化/缩放和集成
         joint_positions = self.default_pos + (self.action * self._action_scale)
         self._policy_counter += 1
         return joint_positions
