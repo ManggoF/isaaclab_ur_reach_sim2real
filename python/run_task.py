@@ -58,7 +58,7 @@ class ReachPolicy(Node):
             self.get_logger().info("已接收到第一个人脸位姿目标，机器人开始运动。")
             self.target_received = True
 
-        target_frame = 'base_link'
+        target_frame = 'base'
 
         try:
             # --- 核心：使用TF2进行坐标变换 ---
@@ -128,7 +128,7 @@ class ReachPolicy(Node):
         
         if joint_pos is not None:
             if len(joint_pos) != 6:
-                raise Exception(f"期望6个关节位置，但得到了 {len(joint_pos)}!")
+                raise Exception(f"期望6个关节位置,但得到了 {len(joint_pos)}!")
             
             self.target_pos = [self.map_joint_angle(pos, i) for i, pos in enumerate(joint_pos)]
             
