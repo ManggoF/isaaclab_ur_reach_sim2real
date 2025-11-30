@@ -21,9 +21,10 @@ class ReachPolicy(Node):
     SERVO_ANGLE_LIMITS = [(-2 * PI, 2 * PI), (-2 * PI, 2 * PI), (-2 * PI, 2 * PI), (-2 * PI, 2 * PI), (-2 * PI, 2 * PI), (-2 * PI, 2 * PI)]
     STATE_TOPIC = '/scaled_joint_trajectory_controller/controller_state'
     CMD_TOPIC = '/scaled_joint_trajectory_controller/joint_trajectory'
-    JOINT_NAMES = ['elbow_joint', 'shoulder_lift_joint', 'shoulder_pan_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
-    JOINT_NAME_TO_IDX = {'elbow_joint': 2, 'shoulder_lift_joint': 1, 'shoulder_pan_joint': 0, 'wrist_1_joint': 3, 'wrist_2_joint': 4, 'wrist_3_joint': 5}
-
+    # JOINT_NAMES = ['elbow_joint', 'shoulder_lift_joint', 'shoulder_pan_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
+    # JOINT_NAME_TO_IDX = {'elbow_joint': 2, 'shoulder_lift_joint': 1, 'shoulder_pan_joint': 0, 'wrist_1_joint': 3, 'wrist_2_joint': 4, 'wrist_3_joint': 5}
+    JOINT_NAMES = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
+    JOINT_NAME_TO_IDX = {'shoulder_pan_joint': 0, 'shoulder_lift_joint': 1, 'elbow_joint': 2,  'wrist_1_joint': 3, 'wrist_2_joint': 4, 'wrist_3_joint': 5}
     def __init__(self, fail_quietly: bool = False, verbose: bool = False):
         super().__init__('reach_policy_node')
 
@@ -58,7 +59,7 @@ class ReachPolicy(Node):
             self.get_logger().info("已接收到第一个人脸位姿目标，机器人开始运动。")
             self.target_received = True
 
-        target_frame = 'base'
+        target_frame = 'base_link'  # 目标参考系(仿真里所使用的)
 
         try:
             # --- 核心：使用TF2进行坐标变换 ---
@@ -92,11 +93,12 @@ class ReachPolicy(Node):
     def sub_callback(self, msg: JointTrajectoryControllerState):
         actual_pos = {}
         for i, joint_name in enumerate(msg.joint_names):
-            joint_pos = msg.reference.positions[i] # joint_pos = msg.actual.positions[i] 22.04
+            joint_pos = msg.feedback.positions[i] # joint_pos = msg.actual.positions[i] 22.04 joint_pos = msg.reference.positions[i] 24.04
             actual_pos[joint_name] = joint_pos
         self.current_pos = actual_pos
-        self.robot.update_joint_state(msg.reference.positions, msg.reference.velocities)
-
+        # self.robot.update_joint_state(msg.reference.positions, msg.reference.velocities)
+        self.robot.update_joint_state(msg.feedback.positions, msg.feedback.velocities)
+        
     def map_joint_angle(self, pos: float, index: int) -> float:
         L, U, inversed = self.SIM_DOF_ANGLE_LIMITS[index]
         A, B = self.SERVO_ANGLE_LIMITS[index]
@@ -110,7 +112,7 @@ class ReachPolicy(Node):
         if not self.target_received:
             return
         
-        joint_pos = self.robot.forward(self.step_size, self.target_command)
+        joint_pos = self.robot.forward(self.step_size, self.target_command) # 这里返回的是关节位置列表
         
         if joint_pos is not None:
             if len(joint_pos) != 6:
