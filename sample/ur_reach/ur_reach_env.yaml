@@ -35,7 +35,7 @@ scene:
       - 0.0
       - 0.0
       joint_pos:
-        shoulder_pan_joint: 0.7854
+        shoulder_pan_joint: -0.7854
         shoulder_lift_joint: -1.3963
         elbow_joint: 1.9199
         wrist_1_joint: -1.5708

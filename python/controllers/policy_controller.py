@@ -66,7 +66,7 @@ class PolicyController:
             self.obs_std = np.load(std_path).astype(np.float32)
             
             # 避免除以零，将过小的标准差设为1.0
-            self.obs_std[np.where(self.obs_std == 0)] = 1.0 
+            # self.obs_std[np.where(self.obs_std == 0)] = 1.0 
             
             print(f"\n✅ Normalization stats loaded. Dim: {self.obs_mean.shape[0]}")
         except Exception as e:
@@ -88,7 +88,16 @@ class PolicyController:
             raise RuntimeError("Normalization stats not loaded before computing action.")
             
         # --- 归一化 (新增) ---
-        obs_norm = (obs - self.obs_mean) / self.obs_std
+        obs_norm = (obs - self.obs_mean) / (self.obs_std + 0.01)
+
+        # !!! 立即打印归一化后的数值 !!!
+        # 检查是否有任何数值超过 5.0 或 10.0
+        print(f"--- Normalized Obs Max Value: {np.max(np.abs(obs_norm)):.2f} ---")
+        print(f"Normalized Δq (D0-5): {np.round(obs_norm[:6], 2)}")
+        print(f"Normalized q_dot (D6-11): {np.round(obs_norm[6:12], 2)}")
+        print(f"Normalized Command (D12-18): {np.round(obs_norm[12:19], 2)}") # 重点观察这个！
+        print(f"Normalized A_prev (D19-24): {np.round(obs_norm[19:25], 2)}")
+
         with torch.no_grad():
             obs = torch.from_numpy(obs_norm).view(1, -1).float()
             action = self.policy(obs).detach().view(-1).numpy()
