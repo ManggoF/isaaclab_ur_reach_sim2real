@@ -20,13 +20,21 @@ class FacePosePublisher(Node):
         self.init_mediapipe()
 
         # --- 2. 定义3D人脸模型 (仅用于solvePnP姿态估计) ---
+        # self.model_points_3d = np.array([
+        #     (0.0, 0.0, 0.0),             # 鼻尖 (Nose tip) - 1
+        #     (0.0, -3.30, -6.30),         # 下巴 (Chin) - 152
+        #     (2.25, 1.70, -4.80),        # 左眼左角 (Left eye left corner) - 33
+        #     (-2.25, 1.70, -4.80),         # 右眼右角 (Right eye right corner) - 263
+        #     (1.50, -1.50, -5.20),       # 左嘴角 (Left Mouth corner) - 61
+        #     (-1.50, -1.50, -5.20)         # 右嘴角 (Right mouth corner) - 291
+        # ], dtype=np.float64)
         self.model_points_3d = np.array([
             (0.0, 0.0, 0.0),             # 鼻尖 (Nose tip) - 1
-            (0.0, -3.30, -6.30),         # 下巴 (Chin) - 152
-            (-2.25, 1.70, -4.80),        # 左眼左角 (Left eye left corner) - 33
-            (2.25, 1.70, -4.80),         # 右眼右角 (Right eye right corner) - 263
-            (-1.50, -1.50, -5.20),       # 左嘴角 (Left Mouth corner) - 61
-            (1.50, -1.50, -5.20)         # 右嘴角 (Right mouth corner) - 291
+            (0.0, 85, -60),         # 下巴 (Chin) - 152
+            (65, -45, -50),        # 右眼左角 (Left eye left corner) - 33
+            (-65, -45, -50),         # 左眼右角 (Right eye right corner) - 263
+            (25, 40, -40),       # 右嘴角 (Left Mouth corner) - 61
+            (-25, 40, -40)         # 左嘴角 (Right mouth corner) - 291
         ], dtype=np.float64)
         self.model_points_indices = [1, 152, 33, 263, 61, 291]
         
@@ -96,6 +104,13 @@ class FacePosePublisher(Node):
                     if not success:
                         continue
                         
+                    # --- 新增：打印旋转矩阵 ---
+                    rotation_vector = np.array([rotation_vector[0], rotation_vector[1], rotation_vector[2]])  # Rotation vector (axis-angle)
+                    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                    self.get_logger().info(f'\n发布人脸在相机坐标系下的 Rotation Matrix111:\n{rotation_matrix}')
+                    
+                    # self.get_logger().info(f'\nRotation[2,0:\n{rotation_matrix[2][0]}')
+
                     # --- 步骤 2: 使用深度相机获取精确的位置 (Position) ---
                     mouth_points_2d = [ (int(face_landmarks.landmark[idx].x * img_w), int(face_landmarks.landmark[idx].y * img_h)) for idx in self.mouth_indices ]
                     mouth_center_2d = np.mean(mouth_points_2d, axis=0).astype(int)
@@ -114,6 +129,22 @@ class FacePosePublisher(Node):
                         )
                         
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
+                    # 1. **修正：应用转置 (解决R是逆变换的问题)**
+                        # R_transposed = R_raw.T，得到 人脸坐标系到相机坐标系的旋转
+                        # rotation_matrix_final = rotation_matrix.T.copy()
+
+                        # # 2. **修正：元素取反 (解决Y/Z轴不对称)**
+                        # # R[1, 2] 和 R[2, 1] 元素取反（Python/NumPy 索引）。
+                        # # 这等效于应用了一个固定的不对称坐标系转换。
+                        # rotation_matrix_final[1, 2] *= -1
+                        # rotation_matrix_final[2, 1] *= -1
+
+                        # 将修正后的最终旋转矩阵转回旋转向量
+                        # 注意：如果这个操作导致矩阵不再严格正交，from_matrix 会进行正交化
+                        # r_check = R.from_matrix(rotation_matrix_final)
+                        # rotation_matrix_final = r_check.as_matrix() # 重新正交化
+                        
+                        rotation_vector_final, _ = cv2.Rodrigues(rotation_matrix)
                         pose_msg = PoseStamped()
                         # 关键：设置消息头，指明这个位姿是相对于哪个坐标系的
                         pose_msg.header.stamp = self.get_clock().now().to_msg()
@@ -125,7 +156,7 @@ class FacePosePublisher(Node):
                         pose_msg.pose.position.z = pos_in_camera_frame[2]
                         
                         # 填充姿态 (仅从旋转向量转为四元数)
-                        r = R.from_rotvec(rotation_vector.flatten())
+                        r = R.from_rotvec(rotation_vector_final.flatten())
                         quat = r.as_quat() # [x, y, z, w]
                         
                         pose_msg.pose.orientation.x = quat[0]
@@ -138,6 +169,10 @@ class FacePosePublisher(Node):
                         # 日志可以简化或保留相机坐标系下的值
                         self.get_logger().info(f'发布相机坐标系下的位姿: Pos(x={pos_in_camera_frame[0]:.2f}) y={pos_in_camera_frame[1]:.2f} z={pos_in_camera_frame[2]:.2f}), ')
                         
+                        quat_ros = pose_msg.pose.orientation
+                        quat_list = [quat_ros.x, quat_ros.y, quat_ros.z, quat_ros.w]
+                        rotation_matrix = R.from_quat(quat_list).as_matrix()
+                        self.get_logger().info(f'\n发布相机坐标系下的 Rotation Matrix:\n{rotation_matrix}')
 
                     # --- 可视化部分 (仍然使用旧数据来保证显示正确性) ---
                     mouth_3d_coords_cm = np.array(pos_in_camera_frame) * 100 if depth > 0 else None
@@ -158,7 +193,7 @@ class FacePosePublisher(Node):
         axis_points_3d = np.array([(0,0,0), (5,0,0), (0,5,0), (0,0,5)], dtype=np.float64)
         axis_points_2d, _ = cv2.projectPoints(axis_points_3d, rvec, tvec, self.camera_matrix, self.dist_coeffs)
         axis_points_2d = axis_points_2d.astype(int).reshape(-1, 2)
-        cv2.line(image, axis_points_2d[0], axis_points_2d[1], (255,0,0), 3)
+        cv2.line(image, axis_points_2d[0], axis_points_2d[1], (255,0,0), 3)   #b
         cv2.line(image, axis_points_2d[0], axis_points_2d[2], (0,255,0), 3)
         cv2.line(image, axis_points_2d[0], axis_points_2d[3], (0,0,255), 3)
 
@@ -174,6 +209,18 @@ class FacePosePublisher(Node):
         angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
         cv2.putText(image, f"Pitch: {angles[0]:.1f}, Yaw: {angles[1]:.1f}, Roll: {angles[2]:.1f}", 
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        # --- 新增：打印旋转矩阵 rmat ---
+        base_y = 90
+        cv2.putText(image, "R Matrix:", (10, base_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # 遍历 rmat 的每一行，并打印出来
+        for i in range(3):
+            # 将 NumPy 数组的一行格式化为字符串，保留 2 位小数
+            row_str = f"[{rmat[i, 0]:.2f}, {rmat[i, 1]:.2f}, {rmat[i, 2]:.2f}]"
+            # 每一行向下偏移 25 像素
+            cv2.putText(image, row_str, (10, base_y + 25 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # --- 打印完毕 ---
 
     def cleanup(self):
         self.pipeline.stop()
