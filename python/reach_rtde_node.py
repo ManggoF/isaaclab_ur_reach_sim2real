@@ -30,6 +30,10 @@ class ReachRTDE(Node):
             # 初始化接收接口 (可选，用于获取当前状态)
             self.rtde_r = rtde_receive.RTDEReceiveInterface(self.ROBOT_IP)
             self.get_logger().info("机器人连接成功！")
+
+
+
+
         except Exception as e:
             self.get_logger().error(f"无法连接到机器人: {e}")
             raise e
@@ -74,13 +78,22 @@ class ReachRTDE(Node):
             )
             
             pos = transformed_pose_stamped.pose.position
-            ori = transformed_pose_stamped.pose.orientation
+            quat_ros = transformed_pose_stamped.pose.orientation
+            quat_list = [quat_ros.x, quat_ros.y, quat_ros.z, quat_ros.w]
+            rotation_matrix = R.from_quat(quat_list).as_matrix()
+            # self.get_logger().info(f'\nqian的 Rotation Matrix:\n{rotation_matrix}')
+            
+            rotation_matrix[:,2] = -rotation_matrix[:,2]
+            rotation_matrix[:,0] = -rotation_matrix[:,0]
+            self.get_logger().info(f'\n后的 Rotation Matrix:\n{rotation_matrix}')
 
+
+            ori= R.from_matrix(rotation_matrix).as_quat()  # [x, y, z, w]
             # --- B. 姿态转换 (Quaternion -> Rotation Vector) ---
             # UR 的 moveL 接受 [x, y, z, rx, ry, rz]
             # 其中 rx, ry, rz 是旋转向量 (Rotation Vector)
             
-            r = R.from_quat([ori.x, ori.y, ori.z, ori.w])
+            r = R.from_quat([ori[0], ori[1], ori[2], ori[3]])
             rot_vec = r.as_rotvec() # 返回 [rx, ry, rz]
 
             # 组合目标点 [x, y, z, rx, ry, rz]
@@ -99,12 +112,27 @@ class ReachRTDE(Node):
                 self.get_logger().info(
                     f"执行 moveL -> Pos: [{target_tcp[0]:.3f}, {target_tcp[1]:.3f}, {target_tcp[2]:.3f}]"
                 )
+                self.get_logger().info(f'\n修正后的 Rotation Matrix:\n{rotation_matrix}')
                 
                 # asynchronous=True 非常重要！
                 # 如果是 False，程序会卡在这里直到运动结束，会导致 ROS 回调阻塞，丢失后续的视觉帧。
                 # 设置为 True 后，机器人会在后台移动，你可以随时发送新的指令覆盖旧的（取决于UR控制器的设置）
-                self.rtde_c.moveL(target_tcp, self.vel, self.acc, asynchronous=True)
+                # self.rtde_c.servoL(target_tcp, self.vel, self.acc, asynchronous=True)
                 
+
+                success = self.rtde_c.servoL(
+                    target_tcp,         # arg0 (List[float])
+                    self.vel,           # arg1 (float) -> v
+                    self.acc,           # arg2 (float) -> a
+                    1.0,                # arg3 (float) -> blend (r)
+                    0.04,              # arg4 (float) -> t (伺服周期)
+                    100                 # arg5 (float) -> lookahead_time
+                )
+
+                if not success:
+                    self.get_logger().error(f"servoL 调用失败 (返回 False)")
+                # ----------------------------------------------------
+
                 self.last_target_pos = target_tcp
 
         except tf2_ros.TransformException as ex:
