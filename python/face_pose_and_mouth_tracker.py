@@ -23,16 +23,16 @@ class FacePosePublisher(Node):
         # self.model_points_3d = np.array([
         #     (0.0, 0.0, 0.0),             # 鼻尖 (Nose tip) - 1
         #     (0.0, -3.30, -6.30),         # 下巴 (Chin) - 152
-        #     (2.25, 1.70, -4.80),        # 左眼左角 (Left eye left corner) - 33
-        #     (-2.25, 1.70, -4.80),         # 右眼右角 (Right eye right corner) - 263
+        #     (2.25, 1.70, -4.80),        # 右眼右角 (Left eye left corner) - 33
+        #     (-2.25, 1.70, -4.80),         # 左眼左角 (Right eye right corner) - 263
         #     (1.50, -1.50, -5.20),       # 左嘴角 (Left Mouth corner) - 61
         #     (-1.50, -1.50, -5.20)         # 右嘴角 (Right mouth corner) - 291
         # ], dtype=np.float64)
         self.model_points_3d = np.array([
             (0.0, 0.0, 0.0),             # 鼻尖 (Nose tip) - 1
             (0.0, 85, -60),         # 下巴 (Chin) - 152
-            (65, -45, -50),        # 右眼左角 (Left eye left corner) - 33
-            (-65, -45, -50),         # 左眼右角 (Right eye right corner) - 263
+            (65, -45, -50),        # 右眼右角 (Left eye left corner) - 33
+            (-65, -45, -50),         # 左眼左角 (Right eye right corner) - 263
             (25, 40, -40),       # 右嘴角 (Left Mouth corner) - 61
             (-25, 40, -40)         # 左嘴角 (Right mouth corner) - 291
         ], dtype=np.float64)
@@ -61,8 +61,8 @@ class FacePosePublisher(Node):
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=1,
                                   refine_landmarks=True,
-                                  min_detection_confidence=0.5,
-                                  min_tracking_confidence=0.5)
+                                  min_detection_confidence=0.8,
+                                  min_tracking_confidence=0.8)
         self.mp_drawing = mp.solutions.drawing_utils
 
     def run_loop(self):
@@ -77,6 +77,9 @@ class FacePosePublisher(Node):
                 continue
 
             color_image = np.asanyarray(color_frame.get_data())
+            # 💡 【关键修改点】：对图像进行 180 度旋转
+            # 这将纠正倒置的图像，使其在 MediaPipe 和 OpenCV 中都能正确处理。
+            # color_image = cv2.rotate(color_image, cv2.ROTATE_180)
             image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(image_rgb)
             

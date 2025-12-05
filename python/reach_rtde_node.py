@@ -117,7 +117,7 @@ class ReachRTDE(Node):
                 # asynchronous=True 非常重要！
                 # 如果是 False，程序会卡在这里直到运动结束，会导致 ROS 回调阻塞，丢失后续的视觉帧。
                 # 设置为 True 后，机器人会在后台移动，你可以随时发送新的指令覆盖旧的（取决于UR控制器的设置）
-                # self.rtde_c.servoL(target_tcp, self.vel, self.acc, asynchronous=True)
+                # self.rtde_c.moveL(target_tcp, self.vel, self.acc, asynchronous=True)
                 
 
                 success = self.rtde_c.servoL(
