@@ -170,12 +170,13 @@ class PoseFusionNode(Node):
         final_pose_msg = None
         
         # 3. 融合逻辑 (T_base^face)
-        if is_pose1_ready and is_pose2_ready:
-            # final_pose_msg = self.average_poses(pose1_base, pose2_base)
-            final_pose_msg = pose1_base
-            self.get_logger().debug("双相机目标融合：使用腕部相机 1")
+        # if is_pose1_ready and is_pose2_ready:
+        #     # final_pose_msg = self.average_poses(pose1_base, pose2_base)
+        #     final_pose_msg = pose1_base
+        #     self.get_logger().debug("双相机目标融合：使用腕部相机 1")
             
-        elif is_pose1_ready:
+        if is_pose1_ready:
+            # 策略：只要腕部相机就绪，就使用它的结果，实现最高优先级。
             final_pose_msg = pose1_base
             self.get_logger().debug("双相机目标融合：使用腕部相机 1")
             
