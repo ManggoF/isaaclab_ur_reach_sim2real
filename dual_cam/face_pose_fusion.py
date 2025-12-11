@@ -171,16 +171,17 @@ class PoseFusionNode(Node):
         
         # 3. 融合逻辑 (T_base^face)
         if is_pose1_ready and is_pose2_ready:
-            final_pose_msg = self.average_poses(pose1_base, pose2_base)
-            self.get_logger().debug("双相机目标融合：求平均")
+            # final_pose_msg = self.average_poses(pose1_base, pose2_base)
+            final_pose_msg = pose1_base
+            self.get_logger().debug("双相机目标融合：使用腕部相机 1")
             
         elif is_pose1_ready:
             final_pose_msg = pose1_base
-            self.get_logger().debug("双相机目标融合：使用相机 1")
+            self.get_logger().debug("双相机目标融合：使用腕部相机 1")
             
         elif is_pose2_ready:
             final_pose_msg = pose2_base
-            self.get_logger().debug("双相机目标融合：使用相机 2")
+            self.get_logger().debug("双相机目标融合：使用固定相机 2")
             
         else:
             self.get_logger().warn("双相机目标融合：当前所有人脸目标均无效或被遮挡")
