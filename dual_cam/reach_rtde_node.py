@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation as R
 
 from geometry_msgs.msg import PoseStamped 
 from rclpy.duration import Duration as RclpyDuration
-
+from std_msgs.msg import Float32
 # --- 引入 ur_rtde ---
 import rtde_control
 import rtde_receive
@@ -29,24 +29,48 @@ class ReachRTDE(Node):
             self.get_logger().error(f"无法连接到机器人: {e}")
             raise e
 
-        # --- 2. 移除 TF2 监听器 ---
-        # self.tf_buffer = Buffer()
-        # self.tf_listener = TransformListener(self.tf_buffer, self)
-        
-        # --- 3. 订阅人脸位姿 (接收的是融合节点处理好的 Base 目标) ---
-        self.face_pose_subscriber = self.create_subscription(
-            PoseStamped, '/face_pose', self.face_pose_callback, 10
-        )
-        
-        # 控制参数
+        # --- 2. 状态和控制参数 ---
         self.target_frame = 'base' # 目标基坐标系
         self.vel = 0.2  # servoL 速度 m/s
         self.acc = 0.1  # servoL 加速度 m/s^2
         self.blend = 0.05 # 混合半径 
         
         self.last_target_pos = None # 用于简单的防抖动
+
+        # --- 3. 嘴部状态控制参数 【新增】---
+        self.mouth_open = False # 机器人的当前停止/运动状态
+        # 嘴巴张开的归一化阈值 (0.02是一个经验值，可能需要根据您的相机和光线条件调整)
+        self.MAR_THRESHOLD = 0.02 
+        # 我们只使用腕部相机 ('wrist_face_pose_node') 作为停止控制的来源
+        self.PRIMARY_CAM_NODE = 'wrist_face_pose_node'
+        
+        # --- 4. 订阅人脸位姿 (接收的是融合节点处理好的 Base 目标) ---
+        self.face_pose_subscriber = self.create_subscription(
+            PoseStamped, '/face_pose', self.face_pose_callback, 10
+        )
+        # --- 5. 订阅嘴部状态 【新增】---
+        self.mouth_state_subscriber = self.create_subscription(
+            Float32, 
+            f'/{self.PRIMARY_CAM_NODE}/mouth_dist', 
+            self.mouth_state_callback, 
+            10
+        )
         
         self.get_logger().info("ReachRTDE 节点已就绪，等待已修正的融合目标...")
+
+    def mouth_state_callback(self, msg: Float32):
+        """接收嘴部垂直距离并判断是否张开"""
+        mar = msg.data # 嘴部垂直距离（Mouth Aspect Ratio的近似值）
+        if mar > self.MAR_THRESHOLD:
+            if not self.mouth_open:
+                # 仅在状态变化时记录警告，防止日志刷屏
+                self.get_logger().warn(f"检测到嘴巴张开 ({mar:.3f} > {self.MAR_THRESHOLD:.3f})。机器人停止跟随。", throttle_duration_sec=1.0)
+            self.mouth_open = True
+        else:
+            if self.mouth_open:
+                # 仅在状态变化时记录信息
+                self.get_logger().info(f"检测到嘴巴闭合 ({mar:.3f})。机器人恢复跟随。")
+            self.mouth_open = False
 
     def face_pose_callback(self, msg: PoseStamped):
         """
@@ -81,19 +105,24 @@ class ReachRTDE(Node):
                 self.get_logger().warn("目标点过低，已自动抬高保护")
                 target_tcp[2] = 0.05
 
-            # --- E. 发送控制指令 servoL ---
+            # --- E. 控制指令发送 (Gated by mouth state) 【核心修改】---
+            if self.mouth_open:
+                self.get_logger().warn("跳过 servoL：嘴巴张开，保持当前位置。", throttle_duration_sec=1.0)
+                return # 跳过所有运动指令，机器人将停留在上一个 servoL 位置
+
+            # 只有嘴巴闭合时，才检查是否需要移动
             if self.should_move(target_tcp):
                 self.get_logger().info(
                     f"执行 servoL -> Pos: [{target_tcp[0]:.3f}, {target_tcp[1]:.3f}, {target_tcp[2]:.3f}]"
                 )
                 
                 success = self.rtde_c.servoL(
-                    target_tcp,         # arg0 (List[float])
-                    self.vel,           # arg1 (float) -> v
-                    self.acc,           # arg2 (float) -> a
-                    1.0,                # arg3 (float) -> blend (r)
-                    0.04,              # arg4 (float) -> t (伺服周期)
-                    100                 # arg5 (float) -> lookahead_time
+                    target_tcp,         
+                    self.vel,           
+                    self.acc,           
+                    self.blend, # 使用 self.blend 
+                    0.04,              
+                    100                 
                 )
 
                 if not success:
