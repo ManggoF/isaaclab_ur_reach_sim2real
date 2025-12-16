@@ -122,7 +122,7 @@ class ReachRTDE(Node):
                     self.acc,           
                     self.blend, # 使用 self.blend 
                     0.04,              
-                    100                 
+                    100 # lookahead_time (推荐 0.03 到 0.2)               
                 )
 
                 if not success:

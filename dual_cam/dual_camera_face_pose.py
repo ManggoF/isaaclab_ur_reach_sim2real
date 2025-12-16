@@ -155,20 +155,45 @@ class FacePosePublisher(Node):
                     pos_in_camera_frame = rs.rs2_deproject_pixel_to_point(
                         self.intr, [mouth_center_2d[0], mouth_center_2d[1]], depth
                     )
-                    # -----------------------------------------------------------------
-                    # 【关键修改 A】计算并发布嘴唇垂直距离
-                    # -----------------------------------------------------------------
-                    top_lip = face_landmarks.landmark[self.TOP_LIP_IDX]
-                    bottom_lip = face_landmarks.landmark[self.BOTTOM_LIP_IDX]
+                    # # -----------------------------------------------------------------
+                    # # 【关键修改 A】计算并发布嘴唇垂直距离
+                    # # -----------------------------------------------------------------
+                    # top_lip = face_landmarks.landmark[self.TOP_LIP_IDX]
+                    # bottom_lip = face_landmarks.landmark[self.BOTTOM_LIP_IDX]
                     
-                    # 使用归一化坐标计算垂直距离（0到1之间）
-                    vertical_dist_norm = abs(top_lip.y - bottom_lip.y) 
+                    # # 使用归一化坐标计算垂直距离（0到1之间）
+                    # vertical_dist_norm = abs(top_lip.y - bottom_lip.y) 
 
-                    mouth_msg = Float32()
-                    mouth_msg.data = vertical_dist_norm
-                    self.mouth_dist_publisher_.publish(mouth_msg)
-                    self.get_logger().debug(f"[{self.get_name()}] Mouth Dist: {vertical_dist_norm:.3f}")
+                    # mouth_msg = Float32()
+                    # mouth_msg.data = vertical_dist_norm
+                    # self.mouth_dist_publisher_.publish(mouth_msg)
+                    # self.get_logger().debug(f"[{self.get_name()}] Mouth Dist: {vertical_dist_norm:.3f}")
+                    # # -----------------------------------------------------------------
+                    
                     # -----------------------------------------------------------------
+                    # 【关键修改 A】计算并发布嘴唇垂直距离（3D 物理距离）
+                    # -----------------------------------------------------------------
+                    top_lip_2d = (int(face_landmarks.landmark[self.TOP_LIP_IDX].x * img_w), 
+                                int(face_landmarks.landmark[self.TOP_LIP_IDX].y * img_h))
+                    bottom_lip_2d = (int(face_landmarks.landmark[self.BOTTOM_LIP_IDX].x * img_w), 
+                                    int(face_landmarks.landmark[self.BOTTOM_LIP_IDX].y * img_h))
+
+                    # 尝试获取两个点的深度
+                    depth_top = depth_frame.get_distance(top_lip_2d[0], top_lip_2d[1])
+                    depth_bottom = depth_frame.get_distance(bottom_lip_2d[0], bottom_lip_2d[1])
+
+                    if depth_top > 0 and depth_bottom > 0:
+                        # 反投影到 3D 空间
+                        pos_top = rs.rs2_deproject_pixel_to_point(self.intr, top_lip_2d, depth_top)
+                        pos_bottom = rs.rs2_deproject_pixel_to_point(self.intr, bottom_lip_2d, depth_bottom)
+
+                        # 计算 3D 欧氏距离 (米)
+                        vertical_dist_3d = np.linalg.norm(np.array(pos_top) - np.array(pos_bottom))
+
+                        mouth_msg = Float32()
+                        mouth_msg.data = vertical_dist_3d # 现在是 3D 物理距离 (米)
+                        self.mouth_dist_publisher_.publish(mouth_msg)
+                        self.get_logger().debug(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_3d:.4f} m")
                     
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
                     rotation_vector_final, _ = cv2.Rodrigues(rotation_matrix)
