@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 import pyrealsense2 as rs
 import math
+from std_msgs.msg import Float32
 
 # --- ROS2 和 转换库 ---
 import rclpy
@@ -23,6 +24,9 @@ class FacePosePublisher(Node):
         
         # 使用配置的话题创建发布器
         self.publisher_ = self.create_publisher(PoseStamped, self.publish_topic, 10)
+        # 【新增】嘴巴距离发布器
+        # 话题名: /{node_name}/mouth_dist
+        self.mouth_dist_publisher_ = self.create_publisher(Float32, f'/{node_name}/mouth_dist', 10)
         
         # --- 1. 初始化模块 ---
         self.init_realsense()
@@ -41,6 +45,9 @@ class FacePosePublisher(Node):
         
         # 目标点使用嘴部中心
         self.mouth_indices = [13, 14, 78, 308] 
+        # 【新增】用于计算嘴唇垂直距离的地标点索引
+        self.TOP_LIP_IDX = 13
+        self.BOTTOM_LIP_IDX = 14
         
         self.get_logger().info(f"人脸位姿发布节点 '{node_name}' 已启动. 序列号: {serial_number}, 帧: {self.camera_frame_id}, 话题: {self.publish_topic}...")
 
@@ -148,6 +155,20 @@ class FacePosePublisher(Node):
                     pos_in_camera_frame = rs.rs2_deproject_pixel_to_point(
                         self.intr, [mouth_center_2d[0], mouth_center_2d[1]], depth
                     )
+                    # -----------------------------------------------------------------
+                    # 【关键修改 A】计算并发布嘴唇垂直距离
+                    # -----------------------------------------------------------------
+                    top_lip = face_landmarks.landmark[self.TOP_LIP_IDX]
+                    bottom_lip = face_landmarks.landmark[self.BOTTOM_LIP_IDX]
+                    
+                    # 使用归一化坐标计算垂直距离（0到1之间）
+                    vertical_dist_norm = abs(top_lip.y - bottom_lip.y) 
+
+                    mouth_msg = Float32()
+                    mouth_msg.data = vertical_dist_norm
+                    self.mouth_dist_publisher_.publish(mouth_msg)
+                    self.get_logger().debug(f"[{self.get_name()}] Mouth Dist: {vertical_dist_norm:.3f}")
+                    # -----------------------------------------------------------------
                     
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
                     rotation_vector_final, _ = cv2.Rodrigues(rotation_matrix)
