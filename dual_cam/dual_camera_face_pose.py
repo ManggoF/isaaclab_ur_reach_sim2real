@@ -27,6 +27,8 @@ class FacePosePublisher(Node):
         # 【新增】嘴巴距离发布器
         # 话题名: /{node_name}/mouth_dist
         self.mouth_dist_publisher_ = self.create_publisher(Float32, f'/{node_name}/mouth_dist', 10)
+        # 【新增】用于存储最新的图像给主线程显示
+        self.latest_image = None
         
         # --- 1. 初始化模块 ---
         self.init_realsense()
@@ -95,7 +97,7 @@ class FacePosePublisher(Node):
         # 1. 获取帧
         try:
             # 使用 try_wait_for_frames 避免阻塞 timer
-            frames = self.pipeline.wait_for_frames(timeout_ms=10) 
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000) 
             if not frames:
                 return
         except Exception as e:
@@ -109,12 +111,25 @@ class FacePosePublisher(Node):
 
         if not depth_frame or not color_frame:
             return
+        # --- [关键修改 A] 保存原始数据 (未旋转前) 用于位姿计算 ---
+        raw_color_image = np.asanyarray(color_frame.get_data()) 
+        raw_depth_image = np.asanyarray(depth_frame.get_data()) 
+        img_h, img_w = raw_color_image.shape[:2]
 
-        color_image = np.asanyarray(color_frame.get_data())
+        # 3. 新增：腕部相机旋转逻辑
+        color_image = np.asanyarray(color_frame.get_data()) # 将原始数据转为 numpy 数组
+        depth_image = np.asanyarray(depth_frame.get_data()) # 获取深度图的 numpy 数组，以便后续同步旋转
+
+        # 仅针对腕部相机进行 180 度旋转
+        is_wrist_cam = (self.camera_frame_id == 'wrist_cam_optical_frame')
+        if is_wrist_cam:
+            color_image = cv2.rotate(color_image, cv2.ROTATE_180)
+            depth_image = cv2.rotate(depth_image, cv2.ROTATE_180)
+        # -----------------------
+        self.latest_image = color_image # 只需要将画好线和框的图片存起来，供主线程显示
+        # 4. MediaPipe 处理（使用旋转后的图像）
         image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(image_rgb)
-        
-        img_h, img_w, _ = color_image.shape
         
         # --- 位姿计算与发布 ---
         if results.multi_face_landmarks:
@@ -126,14 +141,29 @@ class FacePosePublisher(Node):
                     landmark_drawing_spec=None,
                     connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1))
 
-                # --- 步骤 1: 使用 solvePnP 获取姿态 (Rotation) ---
-                image_points_2d = np.array([
-                    (int(face_landmarks.landmark[idx].x * img_w), int(face_landmarks.landmark[idx].y * img_h))
+                # --- [关键修改 B] 坐标映射函数 ---
+                # 将旋转图上的坐标点映射回原始图上的坐标点
+                def get_orig_uv(landmark):
+                    u_rot = landmark.x * img_w
+                    v_rot = landmark.y * img_h
+                    if is_wrist_cam:
+                        # 180度映射逻辑: 原始 = 宽/高 - 旋转后
+                        return (float(img_w - u_rot), float(img_h - v_rot))
+                    return (float(u_rot), float(v_rot))
+                
+                # # --- 步骤 1: 使用 solvePnP 获取姿态 (Rotation) ---
+                # image_points_2d = np.array([
+                #     (int(face_landmarks.landmark[idx].x * img_w), int(face_landmarks.landmark[idx].y * img_h))
+                #     for idx in self.model_points_indices
+                # ], dtype=np.float64)
+                # --- 步骤 1: 使用映射回来的【原始 2D 点】进行 solvePnP ---
+                image_points_2d_orig = np.array([
+                    get_orig_uv(face_landmarks.landmark[idx])
                     for idx in self.model_points_indices
                 ], dtype=np.float64)
 
                 (success, rotation_vector, tvec_for_vis) = cv2.solvePnP(
-                    self.model_points_3d, image_points_2d, self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+                    self.model_points_3d, image_points_2d_orig, self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
                 )
 
                 if not success:
@@ -149,43 +179,56 @@ class FacePosePublisher(Node):
                 mouth_center_2d[0] = np.clip(mouth_center_2d[0], 0, img_w - 1)
                 mouth_center_2d[1] = np.clip(mouth_center_2d[1], 0, img_h - 1)
                 
-                depth = depth_frame.get_distance(mouth_center_2d[0], mouth_center_2d[1])
+                # depth = depth_frame.get_distance(mouth_center_2d[0], mouth_center_2d[1])
+                # 改为这一行（从旋转后的数组取值，并从mm转换为m）：depth = depth_image[mouth_center_2d[1], mouth_center_2d[0]] * 0.001
+                if is_wrist_cam:
+                    # 180度映射逻辑: 原始 = 宽/高 - 旋转后
+                    u = int(round(img_w - mouth_center_2d[0]))
+                    v = int(round(img_h - mouth_center_2d[1]))
+                else:
+                    u = int(round(mouth_center_2d[0]))
+                    v = int(round(mouth_center_2d[1]))
+                # 1. 确保计算出来的 2D 坐标是整数
 
+                # 2. 将坐标强制限制在相机内参允许的范围内
+                u = max(0, min(u, self.intr.width - 1)) # RealSense 内参定义的范围通常是 [0, width-1] 和 [0, height-1]
+                v = max(0, min(v, self.intr.height - 1)) # 注意：一定要使用 self.intr.width 和 self.intr.height，这是 SDK 最认可的边界
+
+                # 3. 从未旋转的深度图中取值
+                depth = raw_depth_image[v, u] * 0.001
+                
                 if depth > 0:
                     pos_in_camera_frame = rs.rs2_deproject_pixel_to_point(
-                        self.intr, [mouth_center_2d[0], mouth_center_2d[1]], depth
+                        self.intr, [float(u), float(v)], depth
                     )
-                    # # -----------------------------------------------------------------
-                    # # 【关键修改 A】计算并发布嘴唇垂直距离
-                    # # -----------------------------------------------------------------
-                    # top_lip = face_landmarks.landmark[self.TOP_LIP_IDX]
-                    # bottom_lip = face_landmarks.landmark[self.BOTTOM_LIP_IDX]
-                    
-                    # # 使用归一化坐标计算垂直距离（0到1之间）
-                    # vertical_dist_norm = abs(top_lip.y - bottom_lip.y) 
-
-                    # mouth_msg = Float32()
-                    # mouth_msg.data = vertical_dist_norm
-                    # self.mouth_dist_publisher_.publish(mouth_msg)
-                    # self.get_logger().debug(f"[{self.get_name()}] Mouth Dist: {vertical_dist_norm:.3f}")
-                    # # -----------------------------------------------------------------
                     
                     # -----------------------------------------------------------------
-                    # 【关键修改 A】计算并发布嘴唇垂直距离（3D 物理距离）
-                    # -----------------------------------------------------------------
-                    top_lip_2d = (int(face_landmarks.landmark[self.TOP_LIP_IDX].x * img_w), 
-                                int(face_landmarks.landmark[self.TOP_LIP_IDX].y * img_h))
-                    bottom_lip_2d = (int(face_landmarks.landmark[self.BOTTOM_LIP_IDX].x * img_w), 
-                                    int(face_landmarks.landmark[self.BOTTOM_LIP_IDX].y * img_h))
+                    # 【计算并发布嘴唇垂直距离】（3D 物理距离，单位：米）
+                    # 1. 计算像素坐标并强制限制边界 (使用 numpy clip)
+                    # 【计算并发布嘴唇垂直距离】（同样映射回原始图计算）
+                    def get_orig_uv(landmark_idx):
+                        curr_u = face_landmarks.landmark[landmark_idx].x * img_w
+                        curr_v = face_landmarks.landmark[landmark_idx].y * img_h
+                        if is_wrist_cam:
+                            return int(img_w - curr_u), int(img_h - curr_v)
+                        return int(curr_u), int(curr_v)
 
-                    # 尝试获取两个点的深度
-                    depth_top = depth_frame.get_distance(top_lip_2d[0], top_lip_2d[1])
-                    depth_bottom = depth_frame.get_distance(bottom_lip_2d[0], bottom_lip_2d[1])
+                    u_top, v_top = get_orig_uv(self.TOP_LIP_IDX)
+                    u_bot, v_bot = get_orig_uv(self.BOTTOM_LIP_IDX)
 
-                    if depth_top > 0 and depth_bottom > 0:
-                        # 反投影到 3D 空间
-                        pos_top = rs.rs2_deproject_pixel_to_point(self.intr, top_lip_2d, depth_top)
-                        pos_bottom = rs.rs2_deproject_pixel_to_point(self.intr, bottom_lip_2d, depth_bottom)
+                    # 边界检查
+                    u_top, v_top = np.clip(u_top, 0, img_w-1), np.clip(v_top, 0, img_h-1)
+                    u_bot, v_bot = np.clip(u_bot, 0, img_w-1), np.clip(v_bot, 0, img_h-1)
+
+                    # 2. 从原始深度图取深度
+                    d_top = raw_depth_image[v_top, u_top] * 0.001
+                    d_bottom = raw_depth_image[v_bot, u_bot] * 0.001
+
+                    if d_top > 0 and d_bottom > 0:
+                        # 3. 反投影到 3D 空间
+                        # 确保传入的是 float 列表且坐标在合法范围内
+                        pos_top = rs.rs2_deproject_pixel_to_point(self.intr, [float(u_top), float(v_top)], d_top)
+                        pos_bottom = rs.rs2_deproject_pixel_to_point(self.intr, [float(u_bot), float(v_bot)], d_bottom)
 
                         # 计算 3D 欧氏距离 (米)
                         vertical_dist_3d = np.linalg.norm(np.array(pos_top) - np.array(pos_bottom))
@@ -193,7 +236,8 @@ class FacePosePublisher(Node):
                         mouth_msg = Float32()
                         mouth_msg.data = vertical_dist_3d # 现在是 3D 物理距离 (米)
                         self.mouth_dist_publisher_.publish(mouth_msg)
-                        self.get_logger().debug(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_3d:.4f} m")
+                        self.get_logger().info(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_3d:.4f} m")
+                    # -----------------------------------------------------------------
                     
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
                     rotation_vector_final, _ = cv2.Rodrigues(rotation_matrix)
@@ -213,27 +257,36 @@ class FacePosePublisher(Node):
                     pose_msg.pose.orientation.y = quat[1]
                     pose_msg.pose.orientation.z = quat[2]
                     pose_msg.pose.orientation.w = quat[3]
-                    
+
                     # --- 步骤 4: 发布最终的位姿指令 ---
                     self.publisher_.publish(pose_msg)
                     self.get_logger().info(
                         f'[{self.get_name()}] Pos: ({pos_in_camera_frame[0]:.2f}, {pos_in_camera_frame[1]:.2f}, {pos_in_camera_frame[2]:.2f})'
                     )
+                    
 
                 # --- 可视化部分 ---
                 mouth_3d_coords_cm = np.array(pos_in_camera_frame) * 100 if depth > 0 else None
-                # 注意：在多线程环境中，OpenCV 的 imshow 可能需要特殊处理或在主线程中运行
-                # 为了简化，这里保留，但如果出现问题，需要将可视化移出timer_callback
-                self.visualize_all_info(color_image, rotation_vector, tvec_for_vis,
-                                        mouth_center_2d, mouth_3d_coords_cm)
+                # --- 步骤 5: 可视化修正 ---
+                if is_wrist_cam:
+                    # 如果旋转了 180 度，我们要用旋转后的 2D 点重新算一个用于显示的位姿(仅用于可视化)
+                    # 这样 projectPoints 算出来的坐标才能直接画在旋转图上
+                    image_points_2d_vis = np.array([
+                        (int(face_landmarks.landmark[idx].x * img_w), int(face_landmarks.landmark[idx].y * img_h))
+                        for idx in self.model_points_indices
+                    ], dtype=np.float64)
+                    
+                    _, rvec_vis, tvec_vis = cv2.solvePnP(
+                        self.model_points_3d, image_points_2d_vis, self.camera_matrix, self.dist_coeffs
+                    )
+                else:
+                    rvec_vis, tvec_vis = rotation_vector, tvec_for_vis
 
-        # 在多线程环境中，必须将 cv2.imshow 和 waitKey 放在主线程中，或者对窗口进行命名区分
-        # 这里为了保持代码完整性，保留并使用不同的窗口名
-        cv2.imshow(f'Face Pose Publisher ({self.get_name()})', color_image)
-        # 注意：waitkey不能阻塞太久，防止影响ROS线程
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            # 如果是多线程环境，Q键可能无法退出整个executor
-            pass 
+                # 调用可视化（使用修正后的 vis 参数）
+                self.visualize_all_info(color_image, rvec_vis, tvec_vis,
+                                        mouth_center_2d, mouth_3d_coords_cm)
+        
+        
 
     def visualize_all_info(self, image, rvec, tvec, mouth_center_2d, mouth_3d_coords_cm):
         """在图像上绘制所有需要的信息"""
@@ -272,12 +325,9 @@ class FacePosePublisher(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    
     # ----------------------------------------------------
-    # TODO: 请务必修改为您实际的 Realsense 序列号
-    # ----------------------------------------------------
-    WRIST_CAM_SN = "12345678"  # 腕部相机序列号
-    FIXED_CAM_SN = "87654321"  # 固定相机序列号
+    WRIST_CAM_SN = "043322071261"  # 腕部相机序列号
+    FIXED_CAM_SN = "244622070977"  # 固定相机序列号
     # ----------------------------------------------------
 
     # 1. 实例化两个相机节点
@@ -302,8 +352,26 @@ def main(args=None):
     executor.add_node(wrist_node)
     executor.add_node(fixed_node)
     
+    # try:
+    #     executor.spin() # 运行所有节点
+
     try:
-        executor.spin() # 运行所有节点
+        # 【关键修改 B】手动接管主循环
+        while rclpy.ok():
+            # 让 ROS 执行器运行 10 毫秒，处理回调（计算位姿并发布）
+            executor.spin_once(timeout_sec=0.01)
+
+            # 在主线程中刷新两个窗口
+            if wrist_node.latest_image is not None:
+                cv2.imshow('Wrist Camera (MediaPipe)', wrist_node.latest_image)
+            
+            if fixed_node.latest_image is not None:
+                cv2.imshow('Fixed Camera (MediaPipe)', fixed_node.latest_image)
+
+            # 统一处理按键事件
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -313,7 +381,6 @@ def main(args=None):
         wrist_node.cleanup()
         fixed_node.cleanup()
         cv2.destroyAllWindows()
-        
         wrist_node.destroy_node()
         fixed_node.destroy_node()
         rclpy.shutdown()
