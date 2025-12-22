@@ -128,18 +128,28 @@ class PoseFusionNode(Node):
             return None
             
         try:
+            # --- 修改点 1: 检查变换时使用 Time(nanoseconds=0) ---
+            # rclpy.time.Time() 等同于 Time(nanoseconds=0)，代表获取该链路上最新的数据
+            latest_time = rclpy.time.Time()
             # 检查 TF 变换是否可用
             if not self.tf_buffer.can_transform(self.target_frame, raw_pose_stamped.header.frame_id, 
-                                                rclpy.time.Time()):
+                                                latest_time):
                 self.get_logger().warn(
                     f'等待从 {raw_pose_stamped.header.frame_id} 到 {self.target_frame} 的变换...', 
                     throttle_duration_sec=2.0
                 )
                 return None
-            
+    
+            # --- 修改点 2: 转换时不使用消息里的 stamp，而是强制用最新时间 ---
+            # 创建一个新的消息副本，把它的时间戳改为 0
+            # 这样 tf2_geometry_msgs 内部会去查找最新的变换，而不是查找“半小时前”的变换
+            lookup_pose = PoseStamped()
+            lookup_pose.header.frame_id = raw_pose_stamped.header.frame_id
+            lookup_pose.header.stamp = latest_time.to_msg() # 关键：强制设为最新
+            lookup_pose.pose = raw_pose_stamped.pose
             # 执行 TF 变换
             transformed_pose = self.tf_buffer.transform(
-                raw_pose_stamped,
+                lookup_pose,
                 self.target_frame,
                 timeout=RclpyDuration(seconds=0.1)
             )
@@ -155,7 +165,6 @@ class PoseFusionNode(Node):
         """定时器回调，执行融合逻辑"""
         
         now = self.get_clock().now()
-        
         # 1. 检查数据新鲜度
         is_pose1_valid = self.pose1_raw is not None and (now - self.time1) < self.timeout_duration
         is_pose2_valid = self.pose2_raw is not None and (now - self.time2) < self.timeout_duration
@@ -174,18 +183,18 @@ class PoseFusionNode(Node):
         #     # final_pose_msg = self.average_poses(pose1_base, pose2_base)
         #     final_pose_msg = pose1_base
         #     self.get_logger().debug("双相机目标融合：使用腕部相机 1")
-            
+        
         if is_pose1_ready:
             # 策略：只要腕部相机就绪，就使用它的结果，实现最高优先级。
             final_pose_msg = pose1_base
-            self.get_logger().debug("双相机目标融合：使用腕部相机 1")
+            self.get_logger().info("双相机目标融合：使用腕部相机 1")
             
         elif is_pose2_ready:
             final_pose_msg = pose2_base
-            self.get_logger().debug("双相机目标融合：使用固定相机 2")
+            self.get_logger().info("双相机目标融合：使用固定相机 2")
             
         else:
-            self.get_logger().warn("双相机目标融合：当前所有人脸目标均无效或被遮挡")
+            self.get_logger().debug("双相机目标融合：当前所有人脸目标均无效或被遮挡")
             return 
             
         # ------------------------------------------------------------------
