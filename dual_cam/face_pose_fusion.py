@@ -20,8 +20,8 @@ import tf2_geometry_msgs
 # -----------------------------------------------------------------
 TCP_TRANSFORM = np.array([
     [1, 0, 0, 0.0],  # R1 | X (平移)
-    [0, 1, 0, 0.0],  # R2 | Y (平移)
-    [0, 0, 1, 0.15], # R3 | Z (平移) -> 0.15 米 (m)
+    [0, 1, 0, -0.1],  # R2 | Y (平移)
+    [0, 0, 1, 0.25], # R3 | Z (平移) -> 0.25 米 (m)
     [0, 0, 0, 1]     # 0 0 0 | 1
 ], dtype=np.float64) 
 
@@ -30,6 +30,7 @@ def apply_feeding_pose_correction(rotation_matrix_raw: np.ndarray) -> np.ndarray
     """
     根据投喂姿态要求，对人脸坐标系转换后的旋转矩阵进行修正。
     此修正适用于 Base 坐标系下的旋转矩阵。
+    其实就是将 T_base^face 变换为 T_base^tool
     """
     corrected_matrix = rotation_matrix_raw.copy()
     
@@ -202,47 +203,52 @@ class PoseFusionNode(Node):
         # T_base^tool = T_base^face * (T_tool^gripper)^-1
         # ------------------------------------------------------------------
         try:
-            # a. 转换融合后的目标 (T_base^face) 为矩阵
-            T_base_face = pose_to_matrix(final_pose_msg)
+            # a. 转换融合后的原始目标矩阵 (T_base^face_raw)
+            T_base_face_raw = pose_to_matrix(final_pose_msg)
+
+            # b. 【核心步骤：先校正姿态】
+            # 从 Pose 消息中提取当前的四元数并转换为旋转矩阵
+            quat_ros = final_pose_msg.pose.orientation
+            quat_list = [quat_ros.x, quat_ros.y, quat_ros.z, quat_ros.w]
+            rotation_matrix_raw = R.from_quat(quat_list).as_matrix()
             
-            # b. 计算夹爪变换的逆矩阵 (T_tool^gripper)^-1
+            # 应用你的“投喂姿态修正” (翻转 X 和 Z)
+            rotation_matrix_corrected = apply_feeding_pose_correction(rotation_matrix_raw)
+            
+            # 构造姿态校正后的矩阵（位置依然保持在人嘴 T_base_face_raw[:3, 3]）
+            T_base_gripper = np.identity(4)
+            T_base_gripper[:3, :3] = rotation_matrix_corrected
+            T_base_gripper[:3, 3] = T_base_face_raw[:3, 3]
+
+            # c. 【第二步：在这个校正后的坐标系下应用 TCP 偏移】
             T_tool_gripper_inv = np.linalg.inv(TCP_TRANSFORM)
             
-            # c. 计算法兰的目标位姿 (T_base^tool)
-            T_base_tool = T_base_face @ T_tool_gripper_inv
+            # 计算最终法兰盘目标位姿
+            T_base_tool = T_base_gripper @ T_tool_gripper_inv
             
             # d. 转换回 PoseStamped 消息
             final_pose_msg = matrix_to_pose(T_base_tool, self.target_frame, now.to_msg())
-            self.get_logger().debug("已成功应用 TCP 变换。")
             
-        except np.linalg.LinAlgError:
-            self.get_logger().error("TCP 变换矩阵不可逆，请检查 TCP_TRANSFORM 的定义!")
-            return
         except Exception as e:
-            self.get_logger().error(f"应用 TCP 变换时发生错误: {e}")
+            self.get_logger().error(f"变换计算失败: {e}")
             return
-            
-        # --- 5. 应用投喂姿态修正 (对 T_base^tool 进行修正) ---
-        quat_ros = final_pose_msg.pose.orientation
-        quat_list = [quat_ros.x, quat_ros.y, quat_ros.z, quat_ros.w]
-        rotation_matrix_raw = R.from_quat(quat_list).as_matrix()
-        
-        rotation_matrix_corrected = apply_feeding_pose_correction(rotation_matrix_raw)
-        
-        # 转换回四元数并更新消息
-        r_corrected = R.from_matrix(rotation_matrix_corrected)
-        quat_corrected = r_corrected.as_quat()
 
-        final_pose_msg.pose.orientation.x = quat_corrected[0]
-        final_pose_msg.pose.orientation.y = quat_corrected[1]
-        final_pose_msg.pose.orientation.z = quat_corrected[2]
-        final_pose_msg.pose.orientation.w = quat_corrected[3]
-
-        # 6. 发布最终结果
+        # 5. 发布最终结果
         final_pose_msg.header.stamp = now.to_msg() 
         self.publisher.publish(final_pose_msg)
-        self.get_logger().info(f"发布融合位姿: {final_pose_msg.pose.position.x:.3f}, {final_pose_msg.pose.position.y:.3f}, {final_pose_msg.pose.position.z:.3f}")
+        # self.get_logger().info(f"发布融合位姿: {final_pose_msg.pose.position.x:.3f}, {final_pose_msg.pose.position.y:.3f}, {final_pose_msg.pose.position.z:.3f}")
 
+        # 直接从矩阵中提取坐标进行打印，这样逻辑最清晰
+        face_loc = T_base_gripper[:3, 3]  # 这就是人脸位置
+        tool_loc = T_base_tool[:3, 3]     # 这是计算出的法兰盘位置
+
+        self.get_logger().info(
+            f"\n[坐标对齐检查]\n"
+            f"人脸(嘴部): X:{face_loc[0]:.3f}, Y:{face_loc[1]:.3f}, Z:{face_loc[2]:.3f}\n"
+            f"法兰(目标): X:{tool_loc[0]:.3f}, Y:{tool_loc[1]:.3f}, Z:{tool_loc[2]:.3f}\n"
+            f"坐标关系: {np.linalg.norm(tool_loc - face_loc):.3f}m",
+            throttle_duration_sec=0.5
+        )
 
     def average_poses(self, pose_a: PoseStamped, pose_b: PoseStamped) -> PoseStamped:
         """对两个 base 坐标系下的 PoseStamped 进行平均"""

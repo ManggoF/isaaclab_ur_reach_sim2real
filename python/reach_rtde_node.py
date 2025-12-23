@@ -124,9 +124,9 @@ class ReachRTDE(Node):
                     target_tcp,         # arg0 (List[float])
                     self.vel,           # arg1 (float) -> v
                     self.acc,           # arg2 (float) -> a
-                    1.0,                # arg3 (float) -> blend (r)
-                    0.04,              # arg4 (float) -> t (伺服周期)
-                    100                 # arg5 (float) -> lookahead_time
+                    1.0,                # arg3 (float) -> dt
+                    0.04,              # arg4 (float) -> lookahead_time
+                    100                 # arg5 (float) -> gain
                 )
 
                 if not success:
@@ -134,7 +134,6 @@ class ReachRTDE(Node):
                 # ----------------------------------------------------
 
                 self.last_target_pos = target_tcp
-
         except tf2_ros.TransformException as ex:
             self.get_logger().warn(f'TF变换失败: {ex}', throttle_duration_sec=1.0)
         except Exception as e:
@@ -149,7 +148,7 @@ class ReachRTDE(Node):
         dist = np.linalg.norm(np.array(new_target[:3]) - np.array(self.last_target_pos[:3]))
         
         # 阈值：例如 1cm (0.01m)。如果人脸移动小于 1cm，机器人不动作，避免高频抖动
-        if dist > 0.01: 
+        if dist > 0.002: 
             return True
         return False
 

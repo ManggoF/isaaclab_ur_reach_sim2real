@@ -1,4 +1,5 @@
 # reach_rtde_node.py (简化版)
+import time
 import rclpy
 from rclpy.node import Node
 import numpy as np
@@ -31,30 +32,25 @@ class ReachRTDE(Node):
 
         # --- 2. 状态和控制参数 ---
         self.target_frame = 'base' # 目标基坐标系
-        self.vel = 0.2  # servoL 速度 m/s
-        self.acc = 0.1  # servoL 加速度 m/s^2
-        self.blend = 0.05 # 混合半径 
-        
+        self.vel = 0.05  # servoL 速度 m/s
+        self.acc = 0.05  # servoL 加速度 m/s^2
         self.last_target_pos = None # 用于简单的防抖动
-
-        # --- 3. 嘴部状态控制参数 【新增】---
+        self.is_stopping = False # 【新增】逻辑锁：标记是否正在执行停止动作
         self.mouth_open = False # 机器人的当前停止/运动状态
-        # 嘴巴张开的归一化阈值 (0.02是一个经验值，可能需要根据您的相机和光线条件调整)
-        self.MAR_THRESHOLD = 0.02 
-        # 我们只使用腕部相机 ('wrist_face_pose_node') 作为停止控制的来源
-        self.PRIMARY_CAM_NODE = 'wrist_face_pose_node'
+        self.MAR_THRESHOLD = 0.01 # 嘴部垂直距离阈值 (单位: 米) 
         
-        # --- 4. 订阅人脸位姿 (接收的是融合节点处理好的 Base 目标) ---
+        # --- 3. 订阅人脸位姿 (接收的是融合节点处理好的 Base 目标) ---
         self.face_pose_subscriber = self.create_subscription(
             PoseStamped, '/face_pose', self.face_pose_callback, 10
         )
-        # --- 5. 订阅嘴部状态 【新增】---
-        self.mouth_state_subscriber = self.create_subscription(
-            Float32, 
-            f'/{self.PRIMARY_CAM_NODE}/mouth_dist', 
-            self.mouth_state_callback, 
-            10
-        )
+        
+        # --- 4. 订阅嘴部状态 (两个相机都订阅) ---
+        self.sub_mouth_wrist = self.create_subscription(
+            Float32, '/wrist_face_pose_node/mouth_dist', self.mouth_state_callback, 10
+        ) # 订阅腕部相机
+        self.sub_mouth_fixed = self.create_subscription(
+            Float32, '/fixed_face_pose_node/mouth_dist', self.mouth_state_callback, 10
+        ) # 订阅固定相机
         
         self.get_logger().info("ReachRTDE 节点已就绪，等待已修正的融合目标...")
 
@@ -69,6 +65,8 @@ class ReachRTDE(Node):
         else:
             if self.mouth_open:
                 # 仅在状态变化时记录信息
+                # 闭嘴瞬间，清除停止锁，允许重新发送运动指令
+                self.is_stopping = False
                 self.get_logger().info(f"检测到嘴巴闭合 ({mar:.3f})。机器人恢复跟随。")
             self.mouth_open = False
 
@@ -107,42 +105,72 @@ class ReachRTDE(Node):
 
             # --- E. 控制指令发送 (Gated by mouth state) 【核心修改】---
             if self.mouth_open:
-                self.get_logger().warn("跳过 servoL：嘴巴张开，保持当前位置。", throttle_duration_sec=1.0)
-                return # 跳过所有运动指令，机器人将停留在上一个 servoL 位置
+                # stopL(decereation rate)
+                self.rtde_c.stopL(2.0)
+                self.is_stopping = True # 加锁
+                self.get_logger().warn("检测到张嘴：已发送 stopL 强制停止。", throttle_duration_sec=1.0)
+                return # 跳过所有运动指令，机器人将停留在当前位置
+            
+            move_state = self.check_movement(target_tcp)
 
-            # 只有嘴巴闭合时，才检查是否需要移动
-            if self.should_move(target_tcp):
-                self.get_logger().info(
-                    f"执行 servoL -> Pos: [{target_tcp[0]:.3f}, {target_tcp[1]:.3f}, {target_tcp[2]:.3f}]"
+            if move_state == "TOO_LARGE":
+                # 【关键】检测到异常跳变，立即刹车，保护实验者
+                self.rtde_c.stopL(2.0)
+                self.get_logger().error(
+                    f"检测到异常位置跳变 (距离过大)！已触发紧急停止。目标位置: {target_tcp[:3]}"
                 )
-                
+                return
+
+            elif move_state == "NORMAL" and not self.is_stopping:
+            # 只有嘴巴闭合时，才检查是否需要移动
+            # if self.should_move(target_tcp):
+                # self.get_logger().info(
+                #     f"执行 servoL -> Pos: [{target_tcp[0]:.3f}, {target_tcp[1]:.3f}, {target_tcp[2]:.3f}]"
+                # )
+                # self.rtde_c.moveL(target_tcp, self.vel, self.acc, asynchronous=True)
+
+                if not self.rtde_c.isProgramRunning():
+                    self.get_logger().error("RTDE 脚本未运行，正在尝试重新上传...")
+                    self.rtde_c.reuploadScript()
+                    time.sleep(0.1) # 给脚本启动留出微量时间
+                    
                 success = self.rtde_c.servoL(
                     target_tcp,         
                     self.vel,           
                     self.acc,           
-                    self.blend, # 使用 self.blend 
-                    0.04,              
-                    100 # lookahead_time (推荐 0.03 到 0.2)               
+                    2.0, # dt
+                    0.04,# lookahead_time       
+                    100 # gain             
                 )
 
                 if not success:
                     self.get_logger().error(f"servoL 调用失败 (返回 False)")
 
                 self.last_target_pos = target_tcp
+            else: # TOO_SMALL
+                # 忽略微小抖动，不做任何动作
+                pass
+
 
         except Exception as e:
             self.get_logger().error(f'控制指令发送失败: {e}')
 
-    def should_move(self, new_target):
-        """简单的滤波器：只有当目标移动距离超过一定阈值才发送新指令"""
+    
+    def check_movement(self, new_target):
+        """
+        判断移动距离：
+        - 小于 2mm: 忽略 (防止震动)
+        - 2mm ~ 30cm: 正常运动
+        - 大于 30cm: 判定为跳变/误识别，触发保护
+        """
         if self.last_target_pos is None:
-            return True
+            return "NORMAL"
             
         dist = np.linalg.norm(np.array(new_target[:3]) - np.array(self.last_target_pos[:3]))
-        
-        if dist > 0.01: 
-            return True
-        return False
+        if dist > 0.30: return "TOO_LARGE"
+        if dist < 0.002: return "TOO_SMALL"
+            
+        return "NORMAL"
 
 def main(args=None):
     rclpy.init(args=args)
