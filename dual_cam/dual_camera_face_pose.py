@@ -82,6 +82,12 @@ class FacePosePublisher(Node):
                                        [0, self.intr.fy, self.intr.ppy],
                                        [0, 0, 1]], dtype=np.float32)
         self.dist_coeffs = np.zeros(4)
+        #获得深度比例
+        depth_sensor = profile.get_device().first_depth_sensor()
+        self.depth_scale = depth_sensor.get_depth_scale()
+        self.get_logger().info(f"检测到深度单位比例: {self.depth_scale}")
+        # 打印内参进行调试：如果 D405 的 fx 在 400-600 之间是正常的
+        self.get_logger().info(f"D405 内参: fx={self.intr.fx}, fy={self.intr.fy}, ppx={self.intr.ppx}, ppy={self.intr.ppy}")
 
     def init_mediapipe(self):
         self.mp_face_mesh = mp.solutions.face_mesh
@@ -112,19 +118,19 @@ class FacePosePublisher(Node):
         if not depth_frame or not color_frame:
             return
         # --- [关键修改 A] 保存原始数据 (未旋转前) 用于位姿计算 ---
-        raw_color_image = np.asanyarray(color_frame.get_data()) 
-        raw_depth_image = np.asanyarray(depth_frame.get_data()) 
-        img_h, img_w = raw_color_image.shape[:2]
+        # raw_color_image = np.asanyarray(color_frame.get_data()) 
+        # raw_depth_image = np.asanyarray(depth_frame.get_data()) 
+        
 
         # 3. 新增：腕部相机旋转逻辑
         color_image = np.asanyarray(color_frame.get_data()) # 将原始数据转为 numpy 数组
         depth_image = np.asanyarray(depth_frame.get_data()) # 获取深度图的 numpy 数组，以便后续同步旋转
-
+        img_h, img_w = color_image.shape[:2]
         # 仅针对腕部相机进行 180 度旋转
-        is_wrist_cam = (self.camera_frame_id == 'wrist_cam_optical_frame')
-        if is_wrist_cam:
-            color_image = cv2.rotate(color_image, cv2.ROTATE_180)
-            depth_image = cv2.rotate(depth_image, cv2.ROTATE_180)
+        # is_wrist_cam = (self.camera_frame_id == 'wrist_cam_optical_frame')
+        # if is_wrist_cam:
+        #     color_image = cv2.rotate(color_image, cv2.ROTATE_180)
+        #     depth_image = cv2.rotate(depth_image, cv2.ROTATE_180)
         # -----------------------
         self.latest_image = color_image # 只需要将画好线和框的图片存起来，供主线程显示
         # 4. MediaPipe 处理（使用旋转后的图像）
@@ -143,13 +149,17 @@ class FacePosePublisher(Node):
 
                 # --- [关键修改 B] 坐标映射函数 ---
                 # 将旋转图上的坐标点映射回原始图上的坐标点
+                # def get_orig_uv(landmark):
+                #     u_rot = landmark.x * img_w
+                #     v_rot = landmark.y * img_h
+                #     if is_wrist_cam:
+                #         # 180度映射逻辑: 原始 = 宽/高 - 旋转后
+                #         return (float(img_w - u_rot), float(img_h - v_rot))
+                #     return (float(u_rot), float(v_rot))
                 def get_orig_uv(landmark):
-                    u_rot = landmark.x * img_w
-                    v_rot = landmark.y * img_h
-                    if is_wrist_cam:
-                        # 180度映射逻辑: 原始 = 宽/高 - 旋转后
-                        return (float(img_w - u_rot), float(img_h - v_rot))
-                    return (float(u_rot), float(v_rot))
+                    u = landmark.x * img_w
+                    v = landmark.y * img_h
+                    return (float(u), float(v))
                 
                 # # --- 步骤 1: 使用 solvePnP 获取姿态 (Rotation) ---
                 # image_points_2d = np.array([
@@ -180,14 +190,14 @@ class FacePosePublisher(Node):
                 mouth_center_2d[1] = np.clip(mouth_center_2d[1], 0, img_h - 1)
                 
                 # depth = depth_frame.get_distance(mouth_center_2d[0], mouth_center_2d[1])
-                # 改为这一行（从旋转后的数组取值，并从mm转换为m）：depth = depth_image[mouth_center_2d[1], mouth_center_2d[0]] * 0.001
-                if is_wrist_cam:
-                    # 180度映射逻辑: 原始 = 宽/高 - 旋转后
-                    u = int(round(img_w - mouth_center_2d[0]))
-                    v = int(round(img_h - mouth_center_2d[1]))
-                else:
-                    u = int(round(mouth_center_2d[0]))
-                    v = int(round(mouth_center_2d[1]))
+                # 改为这一行（从旋转后的数组取值，并从mm转换为m）：depth = depth_image[mouth_center_2d[1], mouth_center_2d[0]] * self.depth_scale
+                # if is_wrist_cam:
+                #     # 180度映射逻辑: 原始 = 宽/高 - 旋转后
+                #     u = int(round(img_w - mouth_center_2d[0]))
+                #     v = int(round(img_h - mouth_center_2d[1]))
+                # else:
+                u = int(round(mouth_center_2d[0]))
+                v = int(round(mouth_center_2d[1]))
                 # 1. 确保计算出来的 2D 坐标是整数
 
                 # 2. 将坐标强制限制在相机内参允许的范围内
@@ -195,12 +205,28 @@ class FacePosePublisher(Node):
                 v = max(0, min(v, self.intr.height - 1)) # 注意：一定要使用 self.intr.width 和 self.intr.height，这是 SDK 最认可的边界
 
                 # 3. 从未旋转的深度图中取值
-                depth = raw_depth_image[v, u] * 0.001
+                depth = depth_image[v, u] * self.depth_scale
                 
                 if depth > 0:
                     pos_in_camera_frame = rs.rs2_deproject_pixel_to_point(
                         self.intr, [float(u), float(v)], depth
                     )
+                    # # --- 2. 手动按针孔相机模型公式计算 ---
+                    # # 公式: x = (u - ppx) * Z / fx
+                    # manual_x = (float(u) - self.intr.ppx) * depth / self.intr.fx
+                    # manual_y = (float(v) - self.intr.ppy) * depth / self.intr.fy
+                    # manual_z = depth
+                    
+                    # # --- 3. 打印对比调试信息 ---
+                    # # 如果两者差异巨大，说明 SDK 函数对 D405 的解析有问题
+                    # self.get_logger().info(
+                    #     f"\n[{self.get_name()}] 坐标计算对比:\n"
+                    #     f"  - 像素坐标 (u, v): ({u}, {v})\n"
+                    #     f"  - 深度 (Z): {depth:.4f}m\n"
+                    #     f"  - SDK 计算结果: X={pos_in_camera_frame[0]:.4f}, Y={pos_in_camera_frame[1]:.4f}\n"
+                    #     f"  - 手动公式结果: X={manual_x:.4f}, Y={manual_y:.4f}\n"
+                    #     f"  - 当前内参: fx={self.intr.fx:.2f}, ppx={self.intr.ppx:.2f}"
+                    # )
                     
                     # -----------------------------------------------------------------
                     # 【计算并发布嘴唇垂直距离】（3D 物理距离，单位：米）
@@ -209,8 +235,8 @@ class FacePosePublisher(Node):
                     def get_orig_uv(landmark_idx):
                         curr_u = face_landmarks.landmark[landmark_idx].x * img_w
                         curr_v = face_landmarks.landmark[landmark_idx].y * img_h
-                        if is_wrist_cam:
-                            return int(img_w - curr_u), int(img_h - curr_v)
+                        # if is_wrist_cam:
+                        #     return int(img_w - curr_u), int(img_h - curr_v)
                         return int(curr_u), int(curr_v)
 
                     u_top, v_top = get_orig_uv(self.TOP_LIP_IDX)
@@ -221,8 +247,8 @@ class FacePosePublisher(Node):
                     u_bot, v_bot = np.clip(u_bot, 0, img_w-1), np.clip(v_bot, 0, img_h-1)
 
                     # 2. 从原始深度图取深度
-                    d_top = raw_depth_image[v_top, u_top] * 0.001
-                    d_bottom = raw_depth_image[v_bot, u_bot] * 0.001
+                    d_top = depth_image[v_top, u_top] * self.depth_scale
+                    d_bottom = depth_image[v_bot, u_bot] * self.depth_scale
 
                     if d_top > 0 and d_bottom > 0:
                         # 3. 反投影到 3D 空间
@@ -268,19 +294,19 @@ class FacePosePublisher(Node):
                 # --- 可视化部分 ---
                 mouth_3d_coords_cm = np.array(pos_in_camera_frame) * 100 if depth > 0 else None
                 # --- 步骤 5: 可视化修正 ---
-                if is_wrist_cam:
-                    # 如果旋转了 180 度，我们要用旋转后的 2D 点重新算一个用于显示的位姿(仅用于可视化)
-                    # 这样 projectPoints 算出来的坐标才能直接画在旋转图上
-                    image_points_2d_vis = np.array([
-                        (int(face_landmarks.landmark[idx].x * img_w), int(face_landmarks.landmark[idx].y * img_h))
-                        for idx in self.model_points_indices
-                    ], dtype=np.float64)
+                # if is_wrist_cam:
+                #     # 如果旋转了 180 度，我们要用旋转后的 2D 点重新算一个用于显示的位姿(仅用于可视化)
+                #     # 这样 projectPoints 算出来的坐标才能直接画在旋转图上
+                #     image_points_2d_vis = np.array([
+                #         (int(face_landmarks.landmark[idx].x * img_w), int(face_landmarks.landmark[idx].y * img_h))
+                #         for idx in self.model_points_indices
+                #     ], dtype=np.float64)
                     
-                    _, rvec_vis, tvec_vis = cv2.solvePnP(
-                        self.model_points_3d, image_points_2d_vis, self.camera_matrix, self.dist_coeffs
-                    )
-                else:
-                    rvec_vis, tvec_vis = rotation_vector, tvec_for_vis
+                #     _, rvec_vis, tvec_vis = cv2.solvePnP(
+                #         self.model_points_3d, image_points_2d_vis, self.camera_matrix, self.dist_coeffs
+                #     )
+                # else:
+                rvec_vis, tvec_vis = rotation_vector, tvec_for_vis
 
                 # 调用可视化（使用修正后的 vis 参数）
                 self.visualize_all_info(color_image, rvec_vis, tvec_vis,
@@ -326,7 +352,8 @@ class FacePosePublisher(Node):
 def main(args=None):
     rclpy.init(args=args)
     # ----------------------------------------------------
-    WRIST_CAM_SN = "043322071261"  # 腕部相机序列号
+    # WRIST_CAM_SN = "043322071261"  # 腕部相机序列号d435i
+    WRIST_CAM_SN = "335122270893"  # 腕部相机序列号d405
     FIXED_CAM_SN = "244622070977"  # 固定相机序列号
     # ----------------------------------------------------
 
@@ -352,8 +379,6 @@ def main(args=None):
     executor.add_node(wrist_node)
     executor.add_node(fixed_node)
     
-    # try:
-    #     executor.spin() # 运行所有节点
 
     try:
         # 【关键修改 B】手动接管主循环
