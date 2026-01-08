@@ -32,8 +32,8 @@ class ReachRTDE(Node):
 
         # --- 2. 状态和控制参数 ---
         self.target_frame = 'base' # 目标基坐标系
-        self.vel = 0.05  # servoL 速度 m/s
-        self.acc = 0.05  # servoL 加速度 m/s^2
+        self.vel = 0.2  # servoL 速度 m/s
+        self.acc = 0.1  # servoL 加速度 m/s^2
         self.last_target_pos = None # 用于简单的防抖动
         self.is_stopping = False # 【新增】逻辑锁：标记是否正在执行停止动作
         self.mouth_open = False # 机器人的当前停止/运动状态
@@ -52,7 +52,36 @@ class ReachRTDE(Node):
             Float32, '/fixed_face_pose_node/mouth_dist', self.mouth_state_callback, 10
         ) # 订阅固定相机
         
+        # self.debug_timer = self.create_timer(0.5, self.print_current_euler)
+        
         self.get_logger().info("ReachRTDE 节点已就绪，等待已修正的融合目标...")
+        
+    def print_current_euler(self):
+        try:
+            # 1. 获取当前 TCP 位姿 [x, y, z, rx, ry, rz]
+            current_pose = self.rtde_r.getActualTCPPose()
+            rx, ry, rz = current_pose[3], current_pose[4], current_pose[5]
+            
+            # 2. 将旋转向量转为 Scipy 旋转对象
+            rot_vec = np.array([rx, ry, rz])
+            r = R.from_rotvec(rot_vec)
+            
+            # 3. 转换为 zyx 欧拉角 (单位：度)
+            # 这里的顺序必须和你 PoseFusionNode 里的 'zyx' 保持一致
+            euler_deg = r.as_euler('zyx', degrees=True)
+            
+            yaw = euler_deg[0]
+            pitch = euler_deg[1]
+            roll = euler_deg[2]
+
+            self.get_logger().info(
+                f"\n[机器人当前姿态监测]\n"
+                f"Rotation Vector (RX, RY, RZ): [{rx:.4f}, {ry:.4f}, {rz:.4f}]\n"
+                f"Euler ZYX (单位:度) -> Yaw: {yaw:.2f}°, Pitch: {pitch:.2f}°, Roll: {roll:.2f}°\n"
+                f"--- 提示: 如果现在水平，请记下此时的 Pitch 和 Roll ---"
+            )
+        except Exception as e:
+            self.get_logger().error(f"读取当前姿态失败: {e}")
 
     def mouth_state_callback(self, msg: Float32):
         """接收嘴部垂直距离并判断是否张开"""
@@ -142,7 +171,7 @@ class ReachRTDE(Node):
                     0.04,# lookahead_time       
                     100 # gain             
                 )
-
+                # success = self.rtde_c.moveL(target_tcp, self.vel, self.acc, asynchronous=True)
                 if not success:
                     self.get_logger().error(f"servoL 调用失败 (返回 False)")
 

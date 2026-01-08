@@ -20,8 +20,8 @@ import tf2_geometry_msgs
 # -----------------------------------------------------------------
 TCP_TRANSFORM = np.array([
     [1, 0, 0, 0.0],  # R1 | X (平移)
-    [0, 1, 0, -0.1],  # R2 | Y (平移)
-    [0, 0, 1, 0.25], # R3 | Z (平移) -> 0.25 米 (m)
+    [0, 1, 0, 0.0],  # R2 | Y (平移)
+    [0, 0, 1, 0.30], # R3 | Z (平移) -> 0.25 米 (m)
     [0, 0, 0, 1]     # 0 0 0 | 1
 ], dtype=np.float64) 
 
@@ -208,16 +208,52 @@ class PoseFusionNode(Node):
 
             # b. 【核心步骤：先校正姿态】
             # 从 Pose 消息中提取当前的四元数并转换为旋转矩阵
-            quat_ros = final_pose_msg.pose.orientation
-            quat_list = [quat_ros.x, quat_ros.y, quat_ros.z, quat_ros.w]
-            rotation_matrix_raw = R.from_quat(quat_list).as_matrix()
-            
+            # quat_ros = final_pose_msg.pose.orientation
+            # quat_list = [quat_ros.x, quat_ros.y, quat_ros.z, quat_ros.w]
+            # rotation_matrix_raw = R.from_quat(quat_list).as_matrix()
+            rotation_matrix_raw = T_base_face_raw[:3, :3]
+
+            # # ------------------------------------------------------------------
+            # # 限制末端一直保持水平
+            # r_raw = R.from_quat(quat_list)
+            # euler = r_raw.as_euler('zyx', degrees=False)
+            # yaw = euler[0]
+            # pitch = euler[1]
+            # roll = euler[2]
+            # # 建议写法
+            # self.get_logger().info(
+            #     f"原始态 -> Yaw: {np.degrees(yaw):.2f}°, Pitch: {np.degrees(pitch):.2f}°, Roll: {np.degrees(roll):.2f}°",
+            #     throttle_duration_sec=1.0  # 每秒只打印一次，方便观察
+            # )
+            # fixed_pitch = 0.0
+            # fixed_roll = np.radians(-90.0)
+            # r_corrected = R.from_euler('zyx', [yaw, fixed_pitch, fixed_roll])
+            # rotation_matrix_raw = r_corrected.as_matrix()
+            # ------------------------------------------------------------------
+
             # 应用你的“投喂姿态修正” (翻转 X 和 Z)
             rotation_matrix_corrected = apply_feeding_pose_correction(rotation_matrix_raw)
             
+            r_corrected = R.from_matrix(rotation_matrix_corrected)
+            # 这里的 zyx 分别对应：yaw(绕Z), pitch(绕Y), roll(绕X)
+            euler = r_corrected.as_euler('zyx', degrees=False)
+            
+            yaw = euler[0]        # 保留指向人脸的偏航角
+            pitch = euler[1]
+            roll = euler[2]
+            fixed_yaw = np.radians(179.9)     # 强制水平
+            fixed_roll = np.radians(90.1)  # 强制水平（根据你的机械臂定义）
+
+            # 重新生成“水平且指向人脸”的夹爪旋转矩阵
+            final_gripper_rot = R.from_euler('zyx', [fixed_yaw, pitch, fixed_roll]).as_matrix()
+            self.get_logger().info(
+                f"原始态 -> Yaw: {np.degrees(yaw):.2f}°, Pitch: {np.degrees(pitch):.2f}°, Roll: {np.degrees(roll):.2f}°",
+                throttle_duration_sec=0.5  # 每秒只打印一次，方便观察
+            )
             # 构造姿态校正后的矩阵（位置依然保持在人嘴 T_base_face_raw[:3, 3]）
             T_base_gripper = np.identity(4)
-            T_base_gripper[:3, :3] = rotation_matrix_corrected
+            # T_base_gripper[:3, :3] = rotation_matrix_corrected
+            T_base_gripper[:3, :3] = final_gripper_rot
             T_base_gripper[:3, 3] = T_base_face_raw[:3, 3]
 
             # c. 【第二步：在这个校正后的坐标系下应用 TCP 偏移】
