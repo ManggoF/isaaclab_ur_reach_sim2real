@@ -21,7 +21,7 @@ import tf2_geometry_msgs
 TCP_TRANSFORM = np.array([
     [1, 0, 0, 0.0],  # R1 | X (平移)
     [0, 1, 0, 0.0],  # R2 | Y (平移)
-    [0, 0, 1, 0.30], # R3 | Z (平移) -> 0.25 米 (m)
+    [0, 0, 1, 0.20], # R3 | Z (平移) -> 0.25 米 (m)
     [0, 0, 0, 1]     # 0 0 0 | 1
 ], dtype=np.float64) 
 
@@ -185,14 +185,14 @@ class PoseFusionNode(Node):
         #     final_pose_msg = pose1_base
         #     self.get_logger().debug("双相机目标融合：使用腕部相机 1")
         
-        if is_pose1_ready:
+        if is_pose2_ready:
             # 策略：只要腕部相机就绪，就使用它的结果，实现最高优先级。
-            final_pose_msg = pose1_base
-            self.get_logger().info("双相机目标融合：使用腕部相机 1")
-            
-        elif is_pose2_ready:
             final_pose_msg = pose2_base
-            self.get_logger().info("双相机目标融合：使用固定相机 2")
+            self.get_logger().info("双相机目标融合：使用guding相机 2")
+            
+        elif is_pose1_ready:
+            final_pose_msg = pose1_base
+            self.get_logger().info("双相机目标融合：使用wanbu相机 1")
             
         else:
             self.get_logger().debug("双相机目标融合：当前所有人脸目标均无效或被遮挡")
