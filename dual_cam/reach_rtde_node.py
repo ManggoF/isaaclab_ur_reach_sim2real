@@ -18,7 +18,7 @@ class ReachRTDE(Node):
         super().__init__('reach_rtde_node')
 
         # --- 1. 配置机器人连接 ---
-        self.ROBOT_IP = "192.168.56.10" 
+        self.ROBOT_IP = "192.168.56.101" 
         
         self.get_logger().info(f"正在连接机器人 RTDE ({self.ROBOT_IP})...")
         try:
@@ -32,12 +32,15 @@ class ReachRTDE(Node):
 
         # --- 2. 状态和控制参数 ---
         self.target_frame = 'base' # 目标基坐标系
-        self.vel = 0.2  # servoL 速度 m/s
+        self.vel = 0.05  # servoL 速度 m/s
         self.acc = 0.1  # servoL 加速度 m/s^2
+        self.servo_dt = 1.0 # servoL 控制周期，需和 /face_pose 发布频率大致匹配
+        self.min_step_dist = 0.002 # 小于 2mm 忽略，防止震动
+        self.max_step_dist = 0.30 # 大于 10cm 判定为异常跳变，触发保护（改大了以容纳首次移动）
         self.last_target_pos = None # 用于简单的防抖动
         self.is_stopping = False # 【新增】逻辑锁：标记是否正在执行停止动作
         self.mouth_open = False # 机器人的当前停止/运动状态
-        self.MAR_THRESHOLD = 0.01 # 嘴部垂直距离阈值 (单位: 米) 
+        self.MAR_THRESHOLD = 10.0 # 嘴部垂直距离阈值 (单位: 毫米) 
         
         # --- 3. 订阅人脸位姿 (接收的是融合节点处理好的 Base 目标) ---
         self.face_pose_subscriber = self.create_subscription(
@@ -85,7 +88,7 @@ class ReachRTDE(Node):
 
     def mouth_state_callback(self, msg: Float32):
         """接收嘴部垂直距离并判断是否张开"""
-        mar = msg.data # 嘴部垂直距离（Mouth Aspect Ratio的近似值）
+        mar = msg.data # 嘴部垂直距离，单位: 毫米
         if mar > self.MAR_THRESHOLD:
             if not self.mouth_open:
                 # 仅在状态变化时记录警告，防止日志刷屏
@@ -167,8 +170,8 @@ class ReachRTDE(Node):
                     target_tcp,         
                     self.vel,           
                     self.acc,           
-                    2.0, # dt
-                    0.04,# lookahead_time       
+                    self.servo_dt,
+                    0.05,# lookahead_time       
                     100 # gain             
                 )
                 # success = self.rtde_c.moveL(target_tcp, self.vel, self.acc, asynchronous=True)
@@ -189,15 +192,28 @@ class ReachRTDE(Node):
         """
         判断移动距离：
         - 小于 2mm: 忽略 (防止震动)
-        - 2mm ~ 30cm: 正常运动
-        - 大于 30cm: 判定为跳变/误识别，触发保护
+        - 2mm ~ 5cm: 正常运动
+        - 大于 5cm: 判定为跳变/误识别，触发保护
         """
         if self.last_target_pos is None:
-            return "NORMAL"
+            try:
+                current_tcp = self.rtde_r.getActualTCPPose()
+                dist = np.linalg.norm(np.array(new_target[:3]) - np.array(current_tcp[:3]))
+                if dist > self.max_step_dist:
+                    self.get_logger().error(
+                        f"首个目标距离当前 TCP 过远 ({dist:.3f}m > {self.max_step_dist:.3f}m)，拒绝执行。"
+                    )
+                    return "TOO_LARGE"
+                if dist < self.min_step_dist:
+                    return "TOO_SMALL"
+                return "NORMAL"
+            except Exception as e:
+                self.get_logger().error(f"无法读取当前 TCP 位姿，拒绝执行首个目标: {e}")
+                return "TOO_LARGE"
             
         dist = np.linalg.norm(np.array(new_target[:3]) - np.array(self.last_target_pos[:3]))
-        if dist > 0.30: return "TOO_LARGE"
-        if dist < 0.002: return "TOO_SMALL"
+        if dist > self.max_step_dist: return "TOO_LARGE"
+        if dist < self.min_step_dist: return "TOO_SMALL"
             
         return "NORMAL"
 
@@ -211,7 +227,8 @@ def main(args=None):
             node.rtde_c.stopScript()
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

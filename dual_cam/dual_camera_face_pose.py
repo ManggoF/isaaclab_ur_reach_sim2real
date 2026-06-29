@@ -229,7 +229,7 @@ class FacePosePublisher(Node):
                     # )
                     
                     # -----------------------------------------------------------------
-                    # 【计算并发布嘴唇垂直距离】（3D 物理距离，单位：米）
+                    # 【计算并发布嘴唇垂直距离】（3D 物理距离，单位：毫米）
                     # 1. 计算像素坐标并强制限制边界 (使用 numpy clip)
                     # 【计算并发布嘴唇垂直距离】（同样映射回原始图计算）
                     def get_orig_uv(landmark_idx):
@@ -256,13 +256,13 @@ class FacePosePublisher(Node):
                         pos_top = rs.rs2_deproject_pixel_to_point(self.intr, [float(u_top), float(v_top)], d_top)
                         pos_bottom = rs.rs2_deproject_pixel_to_point(self.intr, [float(u_bot), float(v_bot)], d_bottom)
 
-                        # 计算 3D 欧氏距离 (米)
-                        vertical_dist_3d = np.linalg.norm(np.array(pos_top) - np.array(pos_bottom))
+                        # 计算 3D 欧氏距离，并转换为毫米
+                        vertical_dist_mm = np.linalg.norm(np.array(pos_top) - np.array(pos_bottom)) * 1000.0
 
                         mouth_msg = Float32()
-                        mouth_msg.data = vertical_dist_3d # 现在是 3D 物理距离 (米)
+                        mouth_msg.data = vertical_dist_mm
                         self.mouth_dist_publisher_.publish(mouth_msg)
-                        self.get_logger().info(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_3d:.4f} m")
+                        self.get_logger().info(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_mm:.2f} mm")
                     # -----------------------------------------------------------------
                     
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
@@ -354,7 +354,7 @@ def main(args=None):
     # ----------------------------------------------------
     # WRIST_CAM_SN = "043322071261"  # 腕部相机序列号d435i
     WRIST_CAM_SN = "335122270893"  # 腕部相机序列号d405
-    FIXED_CAM_SN = "244622070977"  # 固定相机序列号
+    FIXED_CAM_SN = "043322071261"  # 固定相机序列号
     # ----------------------------------------------------
 
     # 1. 实例化两个相机节点

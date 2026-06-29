@@ -30,7 +30,7 @@ except ImportError:
 sys.modules['reactive_diffusion_policy.common.data_models'] = sys.modules['data_models']
 sys.modules['reactive_diffusion_policy'] = sys.modules['data_models']
 
-ROBOT_IP = "192.168.56.10" 
+ROBOT_IP = "192.168.56.101" 
 
 DT = 0.005
 
