@@ -34,7 +34,7 @@ class ReachRTDE(Node):
         self.target_frame = 'base' # 目标基坐标系
         self.vel = 0.05  # servoL 速度 m/s
         self.acc = 0.1  # servoL 加速度 m/s^2
-        self.servo_dt = 1.0 # servoL 控制周期，需和 /face_pose 发布频率大致匹配
+        self.servo_dt = 0.02 # servoL 控制周期，需和 /face_pose 发布频率大致匹配
         self.min_step_dist = 0.002 # 小于 2mm 忽略，防止震动
         self.max_step_dist = 0.30 # 大于 10cm 判定为异常跳变，触发保护（改大了以容纳首次移动）
         self.last_target_pos = None # 用于简单的防抖动

@@ -28,7 +28,7 @@ done
 echo "UR ports ready ✔"
 
 # 👉 比 sleep 更靠谱：加 handshake buffer
-sleep 5
+sleep 1
 
 # ===== 2. 启动UR driver =====
 echo "[2/4] Launching UR driver..."
