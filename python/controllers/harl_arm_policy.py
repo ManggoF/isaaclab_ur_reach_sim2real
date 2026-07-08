@@ -1,14 +1,6 @@
-import sys
 from pathlib import Path
 
 import numpy as np
-import yaml
-
-
-ISAACLAB_ROOT = Path(__file__).resolve().parents[3]
-if str(ISAACLAB_ROOT) not in sys.path:
-    # 让实机部署脚本可以直接复用 IsaacLab 仓库里的 HARL 网络定义。
-    sys.path.insert(0, str(ISAACLAB_ROOT))
 
 
 class Box:
@@ -24,7 +16,7 @@ class HarlArmPolicy:
     def __init__(
         self,
         model_path: str,
-        algo_cfg_path: str,
+        algo_cfg_path: str | None = None,
         obs_dim: int = 58,
         action_dim: int = 6,
         device: str = "cpu",
@@ -36,7 +28,7 @@ class HarlArmPolicy:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.model_path = Path(model_path).expanduser().resolve()
-        self.algo_cfg_path = Path(algo_cfg_path).expanduser().resolve()
+        self.algo_cfg_path = Path(algo_cfg_path).expanduser().resolve() if algo_cfg_path else None
         self.npz_path = self.model_path.with_suffix(".npz")
         self.scripted_path = self._resolve_scripted_path()
         self.backend: str | None = None
@@ -54,7 +46,7 @@ class HarlArmPolicy:
                 if backend == "torchscript":
                     raise RuntimeError("无法使用 TorchScript 后端加载 arm policy。") from exc
 
-        if backend in {"auto", "torch"}:
+        if backend == "torch" or (backend == "auto" and self.algo_cfg_path is not None):
             try:
                 self._load_torch_policy(device)
                 self.backend = "torch"
@@ -72,10 +64,12 @@ class HarlArmPolicy:
             raise FileNotFoundError(f"NumPy policy 权重不存在: {self.npz_path}")
         raise RuntimeError(
             "无法加载 arm policy。请确认至少满足一种部署方式："
-            f" TorchScript={self.scripted_path}，HARL checkpoint={self.model_path}，NumPy={self.npz_path}"
+            f" TorchScript={self.scripted_path}，NumPy={self.npz_path}"
         ) from (script_error or torch_error)
 
     def _resolve_scripted_path(self) -> Path:
+        if self.model_path.suffix == ".pt" and self.model_path.exists():
+            return self.model_path
         if self.model_path.name.endswith("_torchscript.pt"):
             return self.model_path
         return self.model_path.with_name(f"{self.model_path.stem}_torchscript.pt")
@@ -98,7 +92,13 @@ class HarlArmPolicy:
 
     def _load_torch_policy(self, device: str) -> None:
         try:
+            import sys
             import torch
+
+            isaaclab_root = Path(__file__).resolve().parents[3]
+            if str(isaaclab_root) not in sys.path:
+                # 只有重建 HARL checkpoint 时才需要 IsaacLab/HARL 网络定义。
+                sys.path.insert(0, str(isaaclab_root))
             from harl.models.policy_models.stochastic_policy import StochasticPolicy
         except Exception as exc:
             raise RuntimeError(
@@ -107,6 +107,8 @@ class HarlArmPolicy:
 
         if not self.model_path.exists():
             raise FileNotFoundError(f"arm policy checkpoint 不存在: {self.model_path}")
+        if self.algo_cfg_path is None:
+            raise ValueError("使用 torch/HARL 后端时必须提供 algo_cfg_path。")
         if not self.algo_cfg_path.exists():
             raise FileNotFoundError(f"HARL 配置文件不存在: {self.algo_cfg_path}")
 
@@ -167,6 +169,9 @@ class HarlArmPolicy:
         return True
 
     def _load_actor_args(self) -> dict:
+        import yaml
+
+        assert self.algo_cfg_path is not None
         with open(self.algo_cfg_path, "r", encoding="utf-8") as stream:
             cfg = yaml.safe_load(stream)
 
