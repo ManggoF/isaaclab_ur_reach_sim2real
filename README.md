@@ -115,6 +115,10 @@ Follow these steps to run the simulation:
 
 This section is a work in progress (WIP).
 
+### Tool Mass and Center-of-Mass Calibration
+
+Use `deploy/measure_tool_com.py` to identify the combined gripper-and-spoon payload from static multi-pose force/torque measurements. The procedure, safety constraints, output fields, and simulation update method are documented in [TOOL_COM_CALIBRATION.md](TOOL_COM_CALIBRATION.md).
+
 ## Acknowledgments
 
 - **[Johnson Sun](https://github.com/j3soon)**: Many thanks for his valuable advice and time.

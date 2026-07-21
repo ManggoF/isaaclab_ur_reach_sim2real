@@ -8,3 +8,5 @@ isaaclab/__pycache__
 *.png
 *.jpeg
 *.pt
+*.csv
+*.json
