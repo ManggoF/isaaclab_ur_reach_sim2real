@@ -10,7 +10,7 @@ echo "=============================="
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 
-cd ~/isaaclab_ur_reach_sim2real/dual_cam
+cd ~/isaaclab_ur_reach_sim2real/deploy
 
 cleanup() {
   echo ""

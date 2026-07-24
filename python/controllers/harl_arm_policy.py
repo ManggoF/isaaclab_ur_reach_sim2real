@@ -1,6 +1,15 @@
+import sys
 from pathlib import Path
 
 import numpy as np
+import yaml
+
+
+ISAACLAB_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_ALGO_CFG = ISAACLAB_ROOT / "source/isaaclab_tasks/isaaclab_tasks/direct/ur5_mouth_marl_env/agents/harl_happo_cfg.yaml"
+if str(ISAACLAB_ROOT) not in sys.path:
+    # 让实机部署脚本可以直接复用 IsaacLab 仓库里的 HARL 网络定义。
+    sys.path.insert(0, str(ISAACLAB_ROOT))
 
 
 class Box:
@@ -28,7 +37,8 @@ class HarlArmPolicy:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.model_path = Path(model_path).expanduser().resolve()
-        self.algo_cfg_path = Path(algo_cfg_path).expanduser().resolve() if algo_cfg_path else None
+        # Torch后端需要HARL配置重建网络；TorchScript后端也保留同一默认路径，统一部署接口。
+        self.algo_cfg_path = Path(algo_cfg_path or DEFAULT_ALGO_CFG).expanduser().resolve()
         self.npz_path = self.model_path.with_suffix(".npz")
         self.scripted_path = self._resolve_scripted_path()
         self.backend: str | None = None
@@ -46,7 +56,7 @@ class HarlArmPolicy:
                 if backend == "torchscript":
                     raise RuntimeError("无法使用 TorchScript 后端加载 arm policy。") from exc
 
-        if backend == "torch" or (backend == "auto" and self.algo_cfg_path is not None):
+        if backend in {"auto", "torch"}:
             try:
                 self._load_torch_policy(device)
                 self.backend = "torch"
@@ -64,12 +74,10 @@ class HarlArmPolicy:
             raise FileNotFoundError(f"NumPy policy 权重不存在: {self.npz_path}")
         raise RuntimeError(
             "无法加载 arm policy。请确认至少满足一种部署方式："
-            f" TorchScript={self.scripted_path}，NumPy={self.npz_path}"
+            f" TorchScript={self.scripted_path}，HARL checkpoint={self.model_path}，NumPy={self.npz_path}"
         ) from (script_error or torch_error)
 
     def _resolve_scripted_path(self) -> Path:
-        if self.model_path.suffix == ".pt" and self.model_path.exists():
-            return self.model_path
         if self.model_path.name.endswith("_torchscript.pt"):
             return self.model_path
         return self.model_path.with_name(f"{self.model_path.stem}_torchscript.pt")
@@ -88,17 +96,27 @@ class HarlArmPolicy:
         # TorchScript 文件已经固化网络结构和权重，实机端不再需要 HARL 包。
         self.scripted_actor = torch.jit.load(str(self.scripted_path), map_location=self.device)
         self.scripted_actor.eval()
+        self._validate_torchscript_dimensions()
         self.loaded_path = self.scripted_path
+
+    def _validate_torchscript_dimensions(self) -> None:
+        """在机械臂开始运动前校验导出模型的输入和动作宽度。"""
+        parameter_shapes = {name: tuple(parameter.shape) for name, parameter in self.scripted_actor.named_parameters()}
+        input_weight = parameter_shapes.get("actor.base.mlp.fc.0.weight")
+        action_bias = parameter_shapes.get("actor.act.action_out.fc_mean.bias")
+        if input_weight is not None and len(input_weight) == 2 and input_weight[1] != self.obs_dim:
+            raise ValueError(
+                f"TorchScript arm policy输入维度为{input_weight[1]}，部署观测维度为{self.obs_dim}；"
+                "请使用与当前58维wrench观测匹配的模型。"
+            )
+        if action_bias is not None and len(action_bias) == 1 and action_bias[0] != self.action_dim:
+            raise ValueError(
+                f"TorchScript arm policy动作维度为{action_bias[0]}，部署期望{self.action_dim}。"
+            )
 
     def _load_torch_policy(self, device: str) -> None:
         try:
-            import sys
             import torch
-
-            isaaclab_root = Path(__file__).resolve().parents[3]
-            if str(isaaclab_root) not in sys.path:
-                # 只有重建 HARL checkpoint 时才需要 IsaacLab/HARL 网络定义。
-                sys.path.insert(0, str(isaaclab_root))
             from harl.models.policy_models.stochastic_policy import StochasticPolicy
         except Exception as exc:
             raise RuntimeError(
@@ -107,8 +125,6 @@ class HarlArmPolicy:
 
         if not self.model_path.exists():
             raise FileNotFoundError(f"arm policy checkpoint 不存在: {self.model_path}")
-        if self.algo_cfg_path is None:
-            raise ValueError("使用 torch/HARL 后端时必须提供 algo_cfg_path。")
         if not self.algo_cfg_path.exists():
             raise FileNotFoundError(f"HARL 配置文件不存在: {self.algo_cfg_path}")
 
@@ -116,17 +132,21 @@ class HarlArmPolicy:
         self.device = torch.device(device)
         args = self._load_actor_args()
         state_dict = torch.load(self.model_path, map_location=self.device)
-        if any(key.startswith("auxiliary_head.") or key.startswith("auxiliary_fusion.") for key in state_dict):
-            # 兼容带 auxiliary head 的 checkpoint；部署输入仍然只给前 58 维。
-            args["use_auxiliary_head"] = True
-
+        # 当前部署没有训练期辅助标签，actor结构直接使用58维运动学+wrench输入。
+        args["use_auxiliary_head"] = False
         args["policy_obs_dim"] = self.obs_dim
-        args["aux_target_dim"] = 1
+        args["aux_target_dim"] = 0
 
-        obs_space = Box((self.obs_dim + args["aux_target_dim"],))
+        obs_space = Box((self.obs_dim,))
         act_space = Box((self.action_dim,))
         self.actor = StochasticPolicy(args, obs_space, act_space, self.device)
-        self.actor.load_state_dict(state_dict)
+        try:
+            self.actor.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            # 兼容性保护: 旧52/59维或带辅助头的checkpoint不能与当前58维策略混用。
+            raise RuntimeError(
+                f"arm checkpoint结构与当前{self.obs_dim}维运动学+wrench策略不一致；请使用匹配版本导出的模型。"
+            ) from exc
         self.actor.eval()
         self.loaded_path = self.model_path
 
@@ -169,9 +189,6 @@ class HarlArmPolicy:
         return True
 
     def _load_actor_args(self) -> dict:
-        import yaml
-
-        assert self.algo_cfg_path is not None
         with open(self.algo_cfg_path, "r", encoding="utf-8") as stream:
             cfg = yaml.safe_load(stream)
 
