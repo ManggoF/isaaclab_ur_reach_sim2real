@@ -43,7 +43,10 @@ class UR5eDLSIK:
         jacobian = self._numerical_jacobian(q, pos, rot)
         lambda_matrix = (self.damping ** 2) * np.eye(6, dtype=np.float64)
         dq = jacobian.T @ np.linalg.solve(jacobian @ jacobian.T + lambda_matrix, pose_error)
-        dq = np.clip(dq, -max_joint_step, max_joint_step)
+        # 与仿真一致: 超过单步关节上限时整组同比缩放，避免逐关节截断改变 IK 运动方向和末端姿态。
+        max_abs_dq = float(np.max(np.abs(dq)))
+        if max_joint_step > 0.0 and max_abs_dq > max_joint_step:
+            dq *= max_joint_step / max_abs_dq
         return np.clip(q + dq, self.lower_limits, self.upper_limits)
 
     def _numerical_jacobian(self, q: np.ndarray, pos: np.ndarray, rot: R) -> np.ndarray:

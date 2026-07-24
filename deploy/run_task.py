@@ -51,19 +51,18 @@ class ArmPolicyDeployNode(Node):
         "wrist_3_joint",
     ]
     JOINT_NAME_TO_IDX = {name: idx for idx, name in enumerate(JOINT_NAMES)}
+    # 与仿真执行器一致: 肩/肘允许20度/秒，三个腕部关节限制为15度/秒。
+    JOINT_MAX_VELOCITIES_RAD_S = np.deg2rad(
+        np.array([20.0, 20.0, 20.0, 15.0, 15.0, 15.0], dtype=np.float32)
+    )
+    ARM_POLICY_OBS_DIM = 52  # 与仿真一致: arm actor只接收52维纯运动学观测，不包含腕部力/力矩。
     DEFAULT_JOINT_POS = np.deg2rad(np.array([-45.0, -80.0, 110.0, -90.0, 0.0, 60.0], dtype=np.float32))
     # 与当前长勺仿真一致: wrist_3_link 到勺心的局部偏移包含新增的 16 cm 延长段。
     SPOON_OFFSET = np.array([0.0, -0.02, 0.2785], dtype=np.float32)
-    # 力觉映射使用当前长勺 play 日志中的自由空间基准，避免继续喂入旧短勺的静置分布。
-    SIM_WRENCH_BIAS_RAW = np.array([0.45056, 2.49334, -0.03529, -0.17357, 0.04846, -0.00117], dtype=np.float32)
-    REAL_WRENCH_BIAS_RAW = np.array([0.12, 0.25, -1.2, 0.01969, -0.00835, -0.1342], dtype=np.float32)
-    WRENCH_SCALE = np.array([0.1, 0.1, 0.1, 1.0, 1.0, 1.0], dtype=np.float32)
-    WRIST_FORCE_CLIP_N = 8.0  # 与仿真一致: 策略输入前按三维力模长限幅。
-    WRIST_TORQUE_CLIP_NM = 1.0  # 与仿真一致: 策略输入前按三维力矩模长限幅。
-    WRIST_WRENCH_FILTER_ALPHA = 0.2  # 与仿真一致: 对映射后的真实 wrench 做一阶低通。
-    USE_REAL_WRENCH_OBS = True
-    # 固定嘴模式直接复现 play 日志中 env_0 的张嘴观测，整个 episode 不旋转也不闭合。
-    DEFAULT_FIXED_MOUTH_POS = np.array([0.56, 0.55, 0.2], dtype=np.float32)
+    SPOON_FORWARD_AXIS_LOCAL = np.array([0.0, 0.0, 1.0], dtype=np.float32)  # 与仿真一致: 勺柄/前送方向取 wrist_3_link 局部+Z。
+    SPOON_UP_AXIS_LOCAL = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # 姿态诊断: 勺面法向取 wrist_3_link 局部+Y，但不参与实机成功门控。
+    # 固定嘴模式使用当前仿真随机范围中心，整个 episode 不旋转也不闭合。
+    DEFAULT_FIXED_MOUTH_POS = np.array([0.675, 0.60, 0.23], dtype=np.float32)
     DEFAULT_FIXED_MOUTH_AXIS = np.array([0.18921, 0.98194, 0.0], dtype=np.float32)
     DEFAULT_FIXED_MOUTH_FEATURE_CENTER = np.array([0.67805, 0.60160, 0.14948], dtype=np.float32)
     DEFAULT_FIXED_MOUTH_FEATURE_POINTS = np.array(
@@ -77,7 +76,9 @@ class ArmPolicyDeployNode(Node):
         ],
         dtype=np.float32,
     )
-    ARM_ACTION_FILTER_ALPHA = 0.85  # 部署动作滤波: 使用训练范围内的固定温和值，不在实机上随机改变响应。
+    ARM_ACTION_ROTATION_SCALE = 0.002  # 与仿真一致: 旋转增量小于平移增量，避免真机将策略姿态动作放大四倍。
+    RESET_ACTION_FREEZE_STEPS = 10  # 与仿真一致: reset 后先冻结10个控制步，避免初始饱和动作立刻改变勺子姿态。
+    RESET_ACTION_RAMP_STEPS = 12  # 与仿真一致: 冻结结束后用12步把实际位姿增量线性放大到完整值。
     WORKSPACE_MIN = np.array([0.15, -0.65, 0.06], dtype=np.float32)
     WORKSPACE_MAX = np.array([0.95, 0.65, 0.75], dtype=np.float32)
     SAFETY_EPS = 1.0e-5
@@ -103,7 +104,12 @@ class ArmPolicyDeployNode(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.policy = HarlArmPolicy(args.model_path, device=args.device, backend=args.policy_backend)
+        self.policy = HarlArmPolicy(
+            args.model_path,
+            obs_dim=self.ARM_POLICY_OBS_DIM,
+            device=args.device,
+            backend=args.policy_backend,
+        )
         self.ik = UR5eDLSIK(damping=args.ik_damping)
 
         self.current_joint_pos: np.ndarray | None = None
@@ -112,10 +118,7 @@ class ArmPolicyDeployNode(Node):
         self.mouth_quat_wxyz: np.ndarray | None = None
         self.fixed_mouth_axis: np.ndarray | None = None
         self.previous_arm_action = np.zeros(6, dtype=np.float32)
-        self.wrist_wrench_raw = np.zeros(6, dtype=np.float32)
-        self.wrist_wrench_policy_raw = self.SIM_WRENCH_BIAS_RAW.copy()
-        self.wrist_wrench_filtered_raw = self.SIM_WRENCH_BIAS_RAW.copy()
-        self.wrist_wrench_obs = np.clip(self.wrist_wrench_policy_raw * self.WRENCH_SCALE, -5.0, 5.0)
+        self.wrist_wrench_raw = np.zeros(6, dtype=np.float32)  # 可选诊断: 真实力只用于debug/CSV，不进入策略观测。
         self.wrench_record_file = None
         self.wrench_record_writer = None
         self.wrench_record_count = 0
@@ -149,11 +152,13 @@ class ArmPolicyDeployNode(Node):
         if not args.fixed_mouth_pose:
             self.create_subscription(PoseStamped, self.mouth_topic, self.face_pose_callback, 10)
         self.create_subscription(Float64, self.SPEED_SCALING_TOPIC, self.speed_scaling_callback, 10)
-        self.create_subscription(WrenchStamped, self.WRENCH_TOPIC, self.wrench_callback, 10)
+        if args.debug_wrench:
+            self.create_subscription(WrenchStamped, self.WRENCH_TOPIC, self.wrench_callback, 10)
 
         self.pub = self.create_publisher(JointTrajectory, self.CMD_TOPIC, 10)
         self.timer = self.create_timer(self.control_period, self.step_callback)
-        self.open_wrench_record()
+        if args.debug_wrench:
+            self.open_wrench_record()
 
         mode = "dry-run，只打印不发关节轨迹" if args.dry_run else "motion enabled，会发布关节轨迹"
         self.get_logger().info(f"arm policy 部署节点已启动: {mode}")
@@ -161,23 +166,21 @@ class ArmPolicyDeployNode(Node):
         self.get_logger().info(f"policy loaded: {self.policy.loaded_path}")
         self.get_logger().info(f"policy backend: {self.policy.backend}")
         self.get_logger().info(
-            f"arm action: scale={self.args.action_scale_arm:.4f}, fixed_filter_alpha={self.ARM_ACTION_FILTER_ALPHA:.2f}"
+            f"arm action: scale={self.args.action_scale_arm:.4f}, limit={self.args.action_limit:.2f}, "
+            f"rotation_scale={self.ARM_ACTION_ROTATION_SCALE:.4f}, action_filter=disabled"
         )
-        if self.USE_REAL_WRENCH_OBS:
-            self.get_logger().info(
-                "wrench 映射: policy_raw = sim_bias - (real_raw - real_bias), "
-                f"sim_bias={np.round(self.SIM_WRENCH_BIAS_RAW, 5)}, "
-                f"real_bias={np.round(self.REAL_WRENCH_BIAS_RAW, 5)}, "
-                f"scale={np.round(self.WRENCH_SCALE, 3)}"
-            )
-        else:
-            self.get_logger().info(
-                "wrench 隔离实验: 策略观测固定使用 sim_bias，真实 wrench 只用于日志对照；"
-                f"policy_input={np.round(self.SIM_WRENCH_BIAS_RAW, 5)}, "
-                f"obs_scaled={np.round(self.SIM_WRENCH_BIAS_RAW * self.WRENCH_SCALE, 5)}"
-            )
+        self.get_logger().info(
+            "joint velocity limits (deg/s): "
+            f"{np.round(np.rad2deg(self.JOINT_MAX_VELOCITIES_RAD_S), 1).tolist()}"
+        )
+        self.get_logger().info(
+            "arm startup: "
+            f"freeze={self.RESET_ACTION_FREEZE_STEPS} steps, "
+            f"ramp={self.RESET_ACTION_RAMP_STEPS} steps"
+        )
+        self.get_logger().info("arm policy输入为52维纯运动学观测，腕部force/torque不参与策略推理。")
         if args.debug_wrench:
-            self.get_logger().info(f"wrench debug 已开启: 只打印 {self.WRENCH_TOPIC} 的真实 force/torque，不打印完整 obs。")
+            self.get_logger().info(f"wrench debug 已开启: {self.WRENCH_TOPIC} 只用于诊断和CSV记录。")
         if args.fixed_mouth_pose:
             self.get_logger().info(
                 "使用固定嘴巴目标: "
@@ -185,12 +188,12 @@ class ArmPolicyDeployNode(Node):
                 f"mouth_axis_w={np.round(self.compute_mouth_axis(), 4)}；姿态和最大张嘴特征在整个 episode 保持不变。"
             )
             self.get_logger().info(
-                f"等待 {self.STATE_TOPIC}、{self.SPEED_SCALING_TOPIC}、{self.WRENCH_TOPIC} "
+                f"等待 {self.STATE_TOPIC}、{self.SPEED_SCALING_TOPIC} "
                 f"和 TF {self.target_frame}->{self.ee_frame} ..."
             )
         else:
             self.get_logger().info(
-                f"等待 {self.mouth_topic}、{self.STATE_TOPIC}、{self.SPEED_SCALING_TOPIC}、{self.WRENCH_TOPIC} "
+                f"等待 {self.mouth_topic}、{self.STATE_TOPIC}、{self.SPEED_SCALING_TOPIC} "
                 f"和 TF {self.target_frame}->{self.ee_frame} ..."
             )
 
@@ -227,7 +230,7 @@ class ArmPolicyDeployNode(Node):
         if not self.target_received:
             self.target_received = True
             self.get_logger().info("已接收到第一个人脸/嘴部目标，arm policy 开始参与控制。")
-            self.get_logger().info("mouth_axis 已默认取反校正，仅影响 58 维观测中的 mouth_axis_w。")
+            self.get_logger().info("mouth_axis 已默认取反校正，仅影响52维观测中的 mouth_axis_w。")
 
     def wrench_callback(self, msg: WrenchStamped) -> None:
         raw = np.array(
@@ -242,35 +245,8 @@ class ArmPolicyDeployNode(Node):
             dtype=np.float32,
         )
         self.wrist_wrench_raw = raw
-        if self.USE_REAL_WRENCH_OBS:
-            # 实机传感器更接近外界施加到 TCP 的 wrench；仿真用的是关节反力。
-            # 先去掉实机静置偏置，再取反并加回仿真静置偏置，让策略看到训练分布里的 wrench。
-            real_delta = raw - self.REAL_WRENCH_BIAS_RAW
-            mapped_wrench = self.SIM_WRENCH_BIAS_RAW - real_delta
-            mapped_wrench = self.clip_wrist_wrench_for_obs(mapped_wrench)
-            alpha = float(np.clip(self.WRIST_WRENCH_FILTER_ALPHA, 0.0, 1.0))
-            self.wrist_wrench_filtered_raw = (
-                (1.0 - alpha) * self.wrist_wrench_filtered_raw + alpha * mapped_wrench
-            ).astype(np.float32)  # 力觉对齐: 复现实机训练中 alpha=0.2 的低通响应。
-            self.wrist_wrench_policy_raw = self.wrist_wrench_filtered_raw.copy()
-        else:
-            # 隔离实验：真实 wrench 只打印，不进入策略，最后 6 维观测固定为仿真静置值。
-            self.wrist_wrench_policy_raw = self.SIM_WRENCH_BIAS_RAW.copy()
-            self.wrist_wrench_filtered_raw = self.wrist_wrench_policy_raw.copy()
-        self.wrist_wrench_obs = np.clip(self.wrist_wrench_policy_raw * self.WRENCH_SCALE, -5.0, 5.0)
         if self.args.debug_wrench:
             self.log_wrench_debug()
-
-    def clip_wrist_wrench_for_obs(self, wrench: np.ndarray) -> np.ndarray:
-        """按仿真相同的三维模长限制力和力矩，同时保留各自方向。"""
-        clipped = np.nan_to_num(np.asarray(wrench, dtype=np.float32).copy(), nan=0.0, posinf=250.0, neginf=-250.0)
-        force_norm = float(np.linalg.norm(clipped[:3]))
-        if force_norm > self.WRIST_FORCE_CLIP_N:
-            clipped[:3] *= self.WRIST_FORCE_CLIP_N / max(force_norm, 1.0e-6)
-        torque_norm = float(np.linalg.norm(clipped[3:]))
-        if torque_norm > self.WRIST_TORQUE_CLIP_NM:
-            clipped[3:] *= self.WRIST_TORQUE_CLIP_NM / max(torque_norm, 1.0e-6)
-        return clipped
 
     def open_wrench_record(self) -> None:
         try:
@@ -292,18 +268,6 @@ class ArmPolicyDeployNode(Node):
                     "raw_tx",
                     "raw_ty",
                     "raw_tz",
-                    "policy_fx",
-                    "policy_fy",
-                    "policy_fz",
-                    "policy_tx",
-                    "policy_ty",
-                    "policy_tz",
-                    "obs_fx",
-                    "obs_fy",
-                    "obs_fz",
-                    "obs_tx",
-                    "obs_ty",
-                    "obs_tz",
                     "mouth_minus_spoon_x",
                     "mouth_minus_spoon_y",
                     "mouth_minus_spoon_z",
@@ -321,12 +285,6 @@ class ArmPolicyDeployNode(Node):
                     "policy_action_rx",
                     "policy_action_ry",
                     "policy_action_rz",
-                    "filtered_action_x",
-                    "filtered_action_y",
-                    "filtered_action_z",
-                    "filtered_action_rx",
-                    "filtered_action_ry",
-                    "filtered_action_rz",
                     "command_action_x",
                     "command_action_y",
                     "command_action_z",
@@ -352,7 +310,6 @@ class ArmPolicyDeployNode(Node):
         spoon_center: np.ndarray,
         raw_action: np.ndarray,
         policy_action: np.ndarray,
-        filtered_action: np.ndarray,
         command_action: np.ndarray,
         arm_delta: np.ndarray,
     ) -> None:
@@ -369,13 +326,10 @@ class ArmPolicyDeployNode(Node):
         row = (
             [time_s, self.policy_step, self.fsm_state, speed_scaling]
             + self.wrist_wrench_raw.astype(float).tolist()
-            + self.wrist_wrench_policy_raw.astype(float).tolist()
-            + self.wrist_wrench_obs.astype(float).tolist()
             + mouth_delta.astype(float).tolist()
             + [dist, float(spoon_center[2])]
             + np.asarray(raw_action, dtype=np.float32).astype(float).tolist()
             + np.asarray(policy_action, dtype=np.float32).astype(float).tolist()
-            + np.asarray(filtered_action, dtype=np.float32).astype(float).tolist()
             + np.asarray(command_action, dtype=np.float32).astype(float).tolist()
             + np.asarray(arm_delta, dtype=np.float32).astype(float).tolist()
         )
@@ -424,23 +378,28 @@ class ArmPolicyDeployNode(Node):
         self.policy_step += 1
         raw_action = self.policy.act(obs)
         policy_action = np.clip(raw_action, -self.args.action_limit, self.args.action_limit).astype(np.float32)
-        filtered_action = self.filter_arm_action(policy_action)
-        command_action = self.limit_command_action(filtered_action)
-        arm_delta = command_action * self.args.action_scale_arm
+        # 与仿真一致: 策略动作只经过硬限幅和单步安全限制，不加入额外低通滤波。
+        command_action = self.limit_command_action(policy_action)
+        startup_action_scale = self.startup_action_scale()
+        # 与仿真一致: 平移和旋转使用独立尺度，启动阶段只缩放真正执行的位姿增量。
+        arm_delta = command_action.copy()
+        arm_delta[:3] *= self.args.action_scale_arm
+        arm_delta[3:] *= self.ARM_ACTION_ROTATION_SCALE
+        arm_delta *= startup_action_scale
         arm_delta_ik = self.ros_delta_to_ik_delta(arm_delta)
         mouth_axis_raw = self.compute_mouth_axis(invert=False)
         mouth_axis = self.compute_mouth_axis()
-        self.record_wrench_sample(spoon_center, raw_action, policy_action, filtered_action, command_action, arm_delta)
+        self.record_wrench_sample(spoon_center, raw_action, policy_action, command_action, arm_delta)
 
         if self.args.debug_obs:
             self.log_observation_debug(
                 obs,
                 raw_action,
                 policy_action,
-                filtered_action,
                 command_action,
                 arm_delta,
                 arm_delta_ik,
+                startup_action_scale,
                 mouth_axis_raw,
                 mouth_axis,
                 spoon_center,
@@ -461,13 +420,12 @@ class ArmPolicyDeployNode(Node):
             max_joint_step=self.args.max_joint_step,
         ).astype(np.float32)
         joint_step = joint_target - self.current_joint_pos
-        # 与训练观测保持一致: previous_arm_action 记录滤波和部署限幅后真正送入 IK 的动作。
+        # 与训练观测保持一致: 历史项记录硬限幅后真正下发的动作，启动缩放只作用于本步实际位姿增量。
         self.previous_arm_action = command_action.copy()
 
         if self.args.dry_run:
             self.get_logger().info(
                 f"dry-run policy_action={np.round(policy_action, 3)}, "
-                f"filtered_action={np.round(filtered_action, 3)}, "
                 f"command_action={np.round(command_action, 3)}, "
                 f"joint_target(deg)={np.round(np.rad2deg(joint_target), 1)}",
                 throttle_duration_sec=0.5,
@@ -526,9 +484,13 @@ class ArmPolicyDeployNode(Node):
         mouth_depth = float(np.dot(mouth_to_spoon, mouth_axis))
         radial_vec = mouth_to_spoon - mouth_depth * mouth_axis
         radial = float(np.linalg.norm(radial_vec))
-        # 与仿真一致: 勺子方向取 wrist_3_link 的局部 +Z，不把带横向分量的勺心偏移误当成方向。
-        spoon_axis = quat_apply_wxyz(ee_quat_wxyz, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        # 姿态诊断: 使用 wrist_3_link 局部+Z/+Y计算倾斜角，仅输出日志，不限制实机成功。
+        spoon_axis = quat_apply_wxyz(ee_quat_wxyz, self.SPOON_FORWARD_AXIS_LOCAL)
         spoon_axis = spoon_axis / max(float(np.linalg.norm(spoon_axis)), 1.0e-6)
+        spoon_up = quat_apply_wxyz(ee_quat_wxyz, self.SPOON_UP_AXIS_LOCAL)
+        spoon_up = spoon_up / max(float(np.linalg.norm(spoon_up)), 1.0e-6)
+        handle_tilt = math.asin(float(np.clip(abs(spoon_axis[2]), 0.0, 1.0)))
+        bowl_tilt = math.acos(float(np.clip(spoon_up[2], -1.0, 1.0)))
         align_dot = float(np.dot(spoon_axis, mouth_axis))
         feed_reached = bool(
             radial < self.args.insert_radius
@@ -541,6 +503,8 @@ class ArmPolicyDeployNode(Node):
             "mouth_spoon_dist": mouth_spoon_dist,
             "spoon_z": float(spoon_center[2]),
             "align_dot": align_dot,
+            "handle_tilt_deg": math.degrees(handle_tilt),
+            "bowl_tilt_deg": math.degrees(bowl_tilt),
             "feed_reached": feed_reached,
             "inserted": feed_reached,
         }
@@ -557,7 +521,8 @@ class ArmPolicyDeployNode(Node):
             metrics_msg = (
                 f", dist={metrics['mouth_spoon_dist']:.4f}m, feed_reached={metrics['feed_reached']}, "
                 f"radial={metrics['radial']:.4f}m, depth={metrics['mouth_depth']:.4f}m, "
-                f"align={metrics['align_dot']:.4f}"
+                f"align={metrics['align_dot']:.4f}, handle_tilt={metrics['handle_tilt_deg']:.2f}deg, "
+                f"bowl_tilt={metrics['bowl_tilt_deg']:.2f}deg"
             )
         self.get_logger().warn(
             f"[episode {reason_type}] {reason}; state={self.fsm_state}, steps={self.policy_step}, "
@@ -603,10 +568,11 @@ class ArmPolicyDeployNode(Node):
                 mouth_feature_points.reshape(-1),
                 mouth_axis,
                 self.previous_arm_action,
-                self.wrist_wrench_obs,
             ],
             dtype=np.float32,
         )
+        if obs.size != self.ARM_POLICY_OBS_DIM:
+            raise RuntimeError(f"arm观测维度错误: expected={self.ARM_POLICY_OBS_DIM}, actual={obs.size}")
         return np.clip(np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0), -5.0, 5.0)
 
     def compute_mouth_axis(self, invert: bool = True) -> np.ndarray:
@@ -644,10 +610,10 @@ class ArmPolicyDeployNode(Node):
         obs: np.ndarray,
         raw_action: np.ndarray,
         policy_action: np.ndarray,
-        filtered_action: np.ndarray,
         command_action: np.ndarray,
         arm_delta: np.ndarray,
         arm_delta_ik: np.ndarray,
+        startup_action_scale: float,
         mouth_axis_raw: np.ndarray,
         mouth_axis: np.ndarray,
         spoon_center: np.ndarray,
@@ -661,8 +627,8 @@ class ArmPolicyDeployNode(Node):
         )
         self.get_logger().info(
             "\n"
-            f"[OBS_DEBUG] step={self.policy_step} arm_obs_dim={obs.size} deploy_prefix_dim=58\n"
-            "[OBS_DEBUG] first 58 dims are deployable arm actor input; deploy has no training-only auxiliary tail.\n"
+            f"[OBS_DEBUG] step={self.policy_step} arm_obs_dim={obs.size} deploy_prefix_dim=52\n"
+            "[OBS_DEBUG] 52 dims are the same pure-kinematic arm actor input used by simulation.\n"
             f"  current_stage = {self.fsm_state}\n"
             f"  joint_pos_minus_default_rad[0:6] = {self.format_debug_array(obs[0:6])}\n"
             f"  joint_vel_rad_s[6:12] = {self.format_debug_array(obs[6:12])}\n"
@@ -674,12 +640,8 @@ class ArmPolicyDeployNode(Node):
             f"{point_lines}\n"
             f"  mouth_axis_w[43:46] = {self.format_debug_array(obs[43:46])}\n"
             f"  previous_arm_action[46:52] = {self.format_debug_array(obs[46:52])}\n"
-            f"  wrist_wrench_obs_scaled[52:58] = {self.format_debug_array(obs[52:58])}\n"
-            f"  wrist_wrench_real_raw = {self.format_debug_array(self.wrist_wrench_raw)}\n"
-            f"  wrist_wrench_real_bias = {self.format_debug_array(self.REAL_WRENCH_BIAS_RAW)}\n"
-            f"  wrist_wrench_policy_input = {self.format_debug_array(self.wrist_wrench_policy_raw)}\n"
-            f"  deploy_obs_full[0:58] = {self.format_debug_array(obs[0:58])}\n"
-            "  training_aux_tail[58:58] = []\n"
+            f"  deploy_obs_full[0:52] = {self.format_debug_array(obs[0:52])}\n"
+            "  wrist_wrench_policy_input = disabled\n"
             "[POLICY_DEBUG]\n"
             f"  mouth_quat_wxyz = {self.format_debug_array(self.mouth_quat_wxyz)}\n"
             f"  mouth_axis_raw(+Z) = {self.format_debug_array(mouth_axis_raw)}\n"
@@ -687,8 +649,8 @@ class ArmPolicyDeployNode(Node):
             f"  mouth_minus_spoon_m = {self.format_debug_array(self.mouth_pos - spoon_center)}\n"
             f"  raw_action = {self.format_debug_array(raw_action)}\n"
             f"  policy_action_for_obs = {self.format_debug_array(policy_action)}\n"
-            f"  filtered_action = {self.format_debug_array(filtered_action)}\n"
             f"  command_action_limited = {self.format_debug_array(command_action)}\n"
+            f"  startup_action_scale = {startup_action_scale:.5f}\n"
             f"  arm_delta_ros = {self.format_debug_array(arm_delta)}\n"
             f"  arm_delta_ik = {self.format_debug_array(arm_delta_ik)}\n"
             f"  fsm_state = {self.fsm_state}\n"
@@ -707,10 +669,7 @@ class ArmPolicyDeployNode(Node):
         self.get_logger().info(
             "[WRENCH_DEBUG] "
             f"real_force={self.format_debug_array(force)}, "
-            f"real_torque={self.format_debug_array(torque)}, "
-            f"real_bias={self.format_debug_array(self.REAL_WRENCH_BIAS_RAW)}, "
-            f"policy_input={self.format_debug_array(self.wrist_wrench_policy_raw)}, "
-            f"obs_scaled={self.format_debug_array(self.wrist_wrench_obs)}",
+            f"real_torque={self.format_debug_array(torque)}; policy_input=disabled",
             throttle_duration_sec=0.5,
         )
 
@@ -724,7 +683,9 @@ class ArmPolicyDeployNode(Node):
             f"feed_reached={self.last_fsm_metrics['feed_reached']}, "
             f"radial={self.last_fsm_metrics['radial']:.4f}, "
             f"depth={self.last_fsm_metrics['mouth_depth']:.4f}, "
-            f"align={self.last_fsm_metrics['align_dot']:.4f}"
+            f"align={self.last_fsm_metrics['align_dot']:.4f}, "
+            f"handle_tilt={self.last_fsm_metrics['handle_tilt_deg']:.2f}deg, "
+            f"bowl_tilt={self.last_fsm_metrics['bowl_tilt_deg']:.2f}deg"
             "}"
         )
 
@@ -758,21 +719,22 @@ class ArmPolicyDeployNode(Node):
         norm = max(float(np.linalg.norm(axis)), 1.0e-6)
         return (axis / norm).astype(np.float32)
 
-    def filter_arm_action(self, policy_action: np.ndarray) -> np.ndarray:
-        """用训练范围内的固定一阶低通滤波模拟部署控制响应，不在实机上随机 alpha。"""
-        alpha = float(np.clip(self.ARM_ACTION_FILTER_ALPHA, 0.0, 1.0))
-        return (alpha * policy_action + (1.0 - alpha) * self.previous_arm_action).astype(np.float32)
+    def startup_action_scale(self) -> float:
+        """复现仿真 reset 后的冻结和线性启动，减小第一批饱和动作造成的姿态突变。"""
+        ramp_steps = max(float(self.RESET_ACTION_RAMP_STEPS), 1.0)
+        return float(np.clip((self.policy_step - self.RESET_ACTION_FREEZE_STEPS) / ramp_steps, 0.0, 1.0))
 
     def limit_command_action(self, policy_action: np.ndarray) -> np.ndarray:
         command_action = np.asarray(policy_action, dtype=np.float32).copy()
-        scale = max(float(self.args.action_scale_arm), 1.0e-6)
+        translation_scale = max(float(self.args.action_scale_arm), 1.0e-6)
+        rotation_scale = max(float(self.ARM_ACTION_ROTATION_SCALE), 1.0e-6)
 
-        trans_delta = command_action[:3] * scale
+        trans_delta = command_action[:3] * translation_scale
         trans_norm = float(np.linalg.norm(trans_delta))
         if trans_norm > self.args.max_cartesian_step:
             command_action[:3] *= self.args.max_cartesian_step / max(trans_norm, 1.0e-6)
 
-        rot_delta = command_action[3:] * scale
+        rot_delta = command_action[3:] * rotation_scale
         rot_norm = float(np.linalg.norm(rot_delta))
         if rot_norm > self.args.max_rotation_step:
             command_action[3:] *= self.args.max_rotation_step / max(rot_norm, 1.0e-6)
@@ -826,8 +788,10 @@ class ArmPolicyDeployNode(Node):
         point = JointTrajectoryPoint()
         point.positions = [float(joint_target[self.JOINT_NAME_TO_IDX[name]]) for name in self.JOINT_NAMES]
 
-        max_move = float(np.max(np.abs(joint_target - self.current_joint_pos)))
-        duration_s = max(self.args.min_trajectory_duration, max_move / max(self.args.max_joint_velocity, 1.0e-6))
+        joint_move = np.abs(joint_target - self.current_joint_pos)
+        # 每个关节按自己的速度上限计算所需时间，整条轨迹采用其中最大值以保证所有关节都不超速。
+        joint_durations = joint_move / np.maximum(self.JOINT_MAX_VELOCITIES_RAD_S, 1.0e-6)
+        duration_s = max(self.args.min_trajectory_duration, float(np.max(joint_durations)))
         sec = int(duration_s)
         nanosec = int((duration_s - sec) * 1.0e9)
         point.time_from_start = Duration(sec=sec, nanosec=nanosec)
@@ -882,7 +846,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--policy-backend", default="auto", choices=["auto", "torchscript", "numpy"], help="Policy inference backend. auto prefers the exported TorchScript model, then .npz.")
     parser.add_argument("--dry-run", action="store_true", help="Only print policy outputs; do not publish joint commands.")
     parser.add_argument("--debug-obs", action="store_true", help="Print low-rate policy observation and action diagnostics.")
-    parser.add_argument("--debug-wrench", action="store_true", help="Print only raw wrist force/torque while the policy keeps running.")
+    parser.add_argument("--debug-wrench", action="store_true", help="Subscribe and record raw wrist force/torque for diagnostics only; never add it to policy observations.")
     parser.add_argument("--invert-mouth-axis", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mouth-topic", default=ArmPolicyDeployNode.DEFAULT_MOUTH_TOPIC, help="PoseStamped topic containing the fused raw mouth pose.")
     parser.set_defaults(fixed_mouth_pose=True)
@@ -895,7 +859,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--joint-state-timeout", type=float, default=0.5, help="Stop commanding if controller_state is older than this many seconds.")
     parser.add_argument("--speed-scaling-timeout", type=float, default=0.5, help="Stop commanding if speed_scaling is older than this many seconds.")
     parser.add_argument("--min-speed-scaling", type=float, default=0.01, help="Do not publish motion commands unless UR speed scaling is at least this value.")
-    parser.add_argument("--episode-length-s", type=float, default=48.0, help="Deployment episode timeout in seconds, matching sim timeout.")
+    parser.add_argument("--episode-length-s", type=float, default=48.0, help="Deployment episode timeout in seconds, matching simulation.")
     parser.add_argument("--max-episode-steps", type=int, default=0, help="Deployment episode timeout in policy steps; <=0 uses episode_length_s * control_hz.")
     parser.add_argument("--feed-distance", type=float, default=0.10, help=argparse.SUPPRESS)
     parser.add_argument("--insert-radius", type=float, default=0.02, help="Maximum spoon radial offset from the mouth axis for success.")
@@ -908,14 +872,13 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--bite-release-steps", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--min-spoon-z", type=float, default=0.06, help="Episode failure threshold for spoon center height in target-frame meters.")
     parser.add_argument("--max-mouth-spoon-distance", type=float, default=0.75, help="Episode failure threshold for mouth-spoon distance; <=0 disables this guard.")
-    parser.add_argument("--action-scale-arm", type=float, default=0.01, help="Scale from policy action to delta pose, matching training.")
-    parser.add_argument("--action-limit", type=float, default=5.0, help="Clamp raw policy action before scaling; default matches sim action history scale.")
+    parser.add_argument("--action-scale-arm", type=float, default=0.008, help="Scale from policy action to delta pose, matching simulation.")
+    parser.add_argument("--action-limit", type=float, default=3.0, help="Clamp policy action before filtering and scaling, matching simulation.")
     parser.add_argument("--ik-damping", type=float, default=0.05, help="DLS IK damping.")
     parser.add_argument("--max-joint-step", type=float, default=math.radians(2.0), help="Maximum joint change per command.")
-    parser.add_argument("--max-joint-velocity", type=float, default=0.4, help="Trajectory duration velocity limit in rad/s.")
     parser.add_argument("--min-trajectory-duration", type=float, default=0.08, help="Minimum JointTrajectory point duration.")
-    parser.add_argument("--max-cartesian-step", type=float, default=0.04, help="Maximum TCP translation step per policy action.")
-    parser.add_argument("--max-rotation-step", type=float, default=0.04, help="Maximum TCP rotation-vector step per policy action.")
+    parser.add_argument("--max-cartesian-step", type=float, default=0.042, help="Vector translation guard; slightly above sqrt(3)*3*0.008 so it does not further clip valid simulation-scale actions.")
+    parser.add_argument("--max-rotation-step", type=float, default=0.042, help="Vector rotation guard; slightly above sqrt(3)*3*0.008 so it does not further clip valid simulation-scale actions.")
     argv = sys.argv[1:]
     if "--ros-args" in argv:
         ros_args_start = argv.index("--ros-args")
