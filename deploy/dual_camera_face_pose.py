@@ -309,8 +309,8 @@ class FacePosePublisher(Node):
                 rvec_vis, tvec_vis = rotation_vector, tvec_for_vis
 
                 # 调用可视化（使用修正后的 vis 参数）
-                self.visualize_all_info(color_image, rvec_vis, tvec_vis,
-                                        mouth_center_2d, mouth_3d_coords_cm)
+                # self.visualize_all_info(color_image, rvec_vis, tvec_vis,
+                                        # mouth_center_2d, mouth_3d_coords_cm)
         
         
 

@@ -13,6 +13,10 @@ import tf2_geometry_msgs
 
 
 class PoseFusionNode(Node):
+    MAX_PUBLISHED_POSITION_STEP_M = 0.02
+    MIN_PUBLISHED_AXIS_DOT = 0.95
+    POSE_FILTER_ALPHA = 0.35
+
     def __init__(self):
         super().__init__('pose_fusion_node')
         
@@ -27,6 +31,9 @@ class PoseFusionNode(Node):
         self.time1 = self.get_clock().now()
         self.time2 = self.get_clock().now()
         self.timeout_duration = RclpyDuration(seconds=0.5) # 0.5秒内未收到，则认为该相机目标无效
+        self.last_published_pose = None
+        self.last_published_axis = None
+        self.last_accepted_time = None
 
         # --- 3. 订阅两个相机的话题 ---
         self.sub1 = self.create_subscription(
@@ -43,7 +50,12 @@ class PoseFusionNode(Node):
         # 每 20ms (50Hz) 进行一次融合计算
         self.timer = self.create_timer(0.02, self.fusion_timer_callback)
         
-        self.get_logger().info("Pose Fusion 节点已就绪...")
+        self.get_logger().info(
+            "Pose Fusion 节点已就绪，双相机自动模式；"
+            f"发布前过滤: max_step={self.MAX_PUBLISHED_POSITION_STEP_M:.3f}m, "
+            f"min_axis_dot={self.MIN_PUBLISHED_AXIS_DOT:.2f}, alpha={self.POSE_FILTER_ALPHA:.2f}, "
+            "hold_last_pose=unlimited"
+        )
         
     def pose1_callback(self, msg: PoseStamped):
         self.pose1_raw = msg
@@ -108,13 +120,14 @@ class PoseFusionNode(Node):
         is_pose2_ready = pose2_base is not None
 
         final_pose_msg = None
+        holding_last_pose = False
         
         # 3. 融合逻辑 (T_base^face)
         # if is_pose1_ready and is_pose2_ready:
         #     # final_pose_msg = self.average_poses(pose1_base, pose2_base)
         #     final_pose_msg = pose1_base
         #     self.get_logger().debug("双相机目标融合：使用腕部相机 1")
-        
+
         if is_pose2_ready:
             # 策略：只要腕部相机就绪，就使用它的结果，实现最高优先级。
             final_pose_msg = pose2_base
@@ -125,10 +138,16 @@ class PoseFusionNode(Node):
             self.get_logger().info("双相机目标融合：使用腕部相机 1")
             
         else:
-            self.get_logger().debug("双相机目标融合：当前所有人脸目标均无效或被遮挡")
-            return 
+            final_pose_msg = self.hold_last_pose(now, "当前所有人脸目标均无效或被遮挡")
+            if final_pose_msg is None:
+                return
+            holding_last_pose = True
 
         # RL 策略需要真实嘴部 pose 作为观测，不需要投喂姿态修正或 TCP 偏移。
+        if not holding_last_pose:
+            final_pose_msg = self.filter_pose_before_publish(final_pose_msg, now)
+            if final_pose_msg is None:
+                return
         final_pose_msg.header.stamp = now.to_msg()
         self.publisher.publish(final_pose_msg)
         self.get_logger().info(
@@ -139,6 +158,118 @@ class PoseFusionNode(Node):
             throttle_duration_sec=0.5,
         )
         return
+
+    def filter_pose_before_publish(self, pose_msg: PoseStamped, now) -> PoseStamped or None:
+        pos = self.pose_position_array(pose_msg)
+        axis = self.pose_axis_array(pose_msg)
+
+        if self.last_published_pose is None:
+            self.last_published_pose = self.copy_pose(pose_msg)
+            self.last_published_axis = axis
+            self.last_accepted_time = now
+            return self.copy_pose(pose_msg)
+
+        last_pos = self.pose_position_array(self.last_published_pose)
+        pos_step = float(np.linalg.norm(pos - last_pos))
+        axis_dot = float(np.dot(axis, self.last_published_axis))
+
+        limited_pos = pos
+        if pos_step > self.MAX_PUBLISHED_POSITION_STEP_M:
+            direction = (pos - last_pos) / max(pos_step, 1.0e-6)
+            limited_pos = last_pos + direction * self.MAX_PUBLISHED_POSITION_STEP_M
+            self.get_logger().warn(
+                f"/mouth_pose 位置变化过大，限速连续更新: "
+                f"step={pos_step:.4f}m > {self.MAX_PUBLISHED_POSITION_STEP_M:.4f}m",
+                throttle_duration_sec=0.5,
+            )
+        use_candidate_quat = True
+        if axis_dot < self.MIN_PUBLISHED_AXIS_DOT:
+            use_candidate_quat = False
+            self.get_logger().warn(
+                f"/mouth_pose 姿态轴跳变，本帧沿用上一帧姿态: "
+                f"dot={axis_dot:.4f} < {self.MIN_PUBLISHED_AXIS_DOT:.4f}",
+                throttle_duration_sec=0.5,
+            )
+
+        filtered_pose = PoseStamped()
+        filtered_pose.header = pose_msg.header
+        alpha = self.POSE_FILTER_ALPHA
+        filtered_pos = (1.0 - alpha) * last_pos + alpha * limited_pos
+        filtered_pose.pose.position.x = float(filtered_pos[0])
+        filtered_pose.pose.position.y = float(filtered_pos[1])
+        filtered_pose.pose.position.z = float(filtered_pos[2])
+
+        last_quat = self.pose_quat_array(self.last_published_pose)
+        if use_candidate_quat:
+            quat = self.pose_quat_array(pose_msg)
+            if float(np.dot(last_quat, quat)) < 0.0:
+                quat = -quat
+        else:
+            quat = last_quat
+        filtered_quat = (1.0 - alpha) * last_quat + alpha * quat
+        filtered_quat /= max(float(np.linalg.norm(filtered_quat)), 1.0e-6)
+        filtered_pose.pose.orientation.x = float(filtered_quat[0])
+        filtered_pose.pose.orientation.y = float(filtered_quat[1])
+        filtered_pose.pose.orientation.z = float(filtered_quat[2])
+        filtered_pose.pose.orientation.w = float(filtered_quat[3])
+
+        self.last_published_pose = filtered_pose
+        self.last_published_axis = self.pose_axis_array(filtered_pose)
+        self.last_accepted_time = now
+        return filtered_pose
+
+    def hold_last_pose(self, now, reason: str) -> PoseStamped or None:
+        if self.last_published_pose is None or self.last_accepted_time is None:
+            self.get_logger().debug(f"{reason}，且没有上一帧可信嘴巴可保持")
+            return None
+
+        hold_age_s = (now - self.last_accepted_time).nanoseconds * 1.0e-9
+        held_pose = self.copy_pose(self.last_published_pose)
+        held_pose.header.stamp = now.to_msg()
+        self.get_logger().warn(
+            f"{reason}，继续发布上一帧可信嘴巴: hold_age={hold_age_s:.2f}s",
+            throttle_duration_sec=0.5,
+        )
+        return held_pose
+
+    @staticmethod
+    def copy_pose(pose_msg: PoseStamped) -> PoseStamped:
+        copied = PoseStamped()
+        copied.header = pose_msg.header
+        copied.pose.position.x = pose_msg.pose.position.x
+        copied.pose.position.y = pose_msg.pose.position.y
+        copied.pose.position.z = pose_msg.pose.position.z
+        copied.pose.orientation.x = pose_msg.pose.orientation.x
+        copied.pose.orientation.y = pose_msg.pose.orientation.y
+        copied.pose.orientation.z = pose_msg.pose.orientation.z
+        copied.pose.orientation.w = pose_msg.pose.orientation.w
+        return copied
+
+    @staticmethod
+    def pose_position_array(pose_msg: PoseStamped) -> np.ndarray:
+        return np.array(
+            [pose_msg.pose.position.x, pose_msg.pose.position.y, pose_msg.pose.position.z],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def pose_quat_array(pose_msg: PoseStamped) -> np.ndarray:
+        return np.array(
+            [
+                pose_msg.pose.orientation.x,
+                pose_msg.pose.orientation.y,
+                pose_msg.pose.orientation.z,
+                pose_msg.pose.orientation.w,
+            ],
+            dtype=np.float64,
+        )
+
+    def pose_axis_array(self, pose_msg: PoseStamped) -> np.ndarray:
+        quat = self.pose_quat_array(pose_msg)
+        quat /= max(float(np.linalg.norm(quat)), 1.0e-6)
+        axis = R.from_quat(quat).apply(np.array([0.0, 0.0, 1.0], dtype=np.float64))
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-6)
+        return axis
 
     def average_poses(self, pose_a: PoseStamped, pose_b: PoseStamped) -> PoseStamped:
         """对两个策略观测坐标系下的 PoseStamped 进行平均"""

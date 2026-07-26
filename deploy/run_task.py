@@ -3,6 +3,7 @@ import csv
 from datetime import datetime
 import math
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
@@ -69,8 +70,11 @@ class ArmPolicyDeployNode(Node):
     WRIST_WRENCH_FILTER_ALPHA = 0.2
     # 固定嘴模式直接复用一帧真实仿真 OBS_DEBUG 样本，确保 mouth_pos/mouth_axis/6个嘴部观测点来自同一个可出现状态。
     DEFAULT_FIXED_MOUTH_POS = np.array([0.77805, 0.55456, 0.21979], dtype=np.float32)
+    # DEFAULT_FIXED_MOUTH_POS = np.array([0.66026, 0.41026, 0.26], dtype=np.float32)
     DEFAULT_FIXED_MOUTH_AXIS = np.array([0.25625, 0.96661, 0.0], dtype=np.float32)
     DEFAULT_FIXED_MOUTH_FEATURE_CENTER = np.array([0.77805, 0.55456, 0.21979], dtype=np.float32)
+    # DEFAULT_FIXED_MOUTH_FEATURE_CENTER = np.array([0.66026, 0.41026, 0.26], dtype=np.float32)
+    # DEFAULT_FIXED_MOUTH_FEATURE_CENTER = np.array([0.665, 0.52, 0.25], dtype=np.float32)
     DEFAULT_FIXED_MOUTH_FEATURE_POINTS = np.array(
         [
             [0.77758, 0.55479, 0.24045],
@@ -82,16 +86,18 @@ class ArmPolicyDeployNode(Node):
         ],
         dtype=np.float32,
     )
-    FEED_INSERT_RADIUS_M = 0.05
-    FEED_INSERT_DEPTH_MIN_M = 0.005
-    FEED_INSERT_DEPTH_MAX_M = 0.035
+    FEED_INSERT_RADIUS_M = 0.04
+    FEED_INSERT_DEPTH_MIN_M = 0.008
+    FEED_INSERT_DEPTH_MAX_M = 0.080
     FEED_INSERT_ALIGN_DOT_MIN = 0.8
     FEED_STABLE_STEPS_REQUIRED = 5
+    SUCCESS_HOLD_STEPS_AFTER_REACHED = 30
+    RESET_AFTER_SUCCESS = True
     ARM_ACTION_ROTATION_SCALE = 0.002  # 与仿真一致: 旋转增量小于平移增量，避免真机将策略姿态动作放大四倍。
     RESET_ACTION_FREEZE_STEPS = 10  # 与仿真一致: reset 后先冻结10个控制步，避免初始饱和动作立刻改变勺子姿态。
     RESET_ACTION_RAMP_STEPS = 12  # 与仿真一致: 冻结结束后用12步把实际位姿增量线性放大到完整值。
     WORKSPACE_MIN = np.array([0.15, -0.65, 0.06], dtype=np.float32)
-    WORKSPACE_MAX = np.array([0.95, 0.75, 0.75], dtype=np.float32)
+    WORKSPACE_MAX = np.array([0.95, 0.95, 0.75], dtype=np.float32)
     SAFETY_EPS = 1.0e-5
     MOUTH_FEATURE_OFFSETS = np.array(
         [
@@ -156,8 +162,11 @@ class ArmPolicyDeployNode(Node):
         self.policy_step = 0
         self.episode_start_time_ns: int | None = None
         self.episode_stopped = False
+        self.reset_started = False
         self.fsm_state = "APPROACH"
         self.feed_stable_steps = 0
+        self.success_hold_steps = 0
+        self.success_hold_joint_pos: np.ndarray | None = None
         self.last_fsm_metrics: dict[str, float | bool] = {}
         self.max_episode_steps = (
             args.max_episode_steps
@@ -540,6 +549,10 @@ class ArmPolicyDeployNode(Node):
         metrics = self.compute_fsm_metrics(spoon_center, ee_quat_wxyz)
         self.last_fsm_metrics = metrics
 
+        if self.fsm_state == "SUCCESS_HOLD":
+            self.update_success_hold(spoon_center)
+            return True
+
         if metrics["spoon_z"] < self.args.min_spoon_z:
             self.stop_episode("FAILURE", f"勺子中心过低: z={metrics['spoon_z']:.4f}m", spoon_center)
             return True
@@ -561,13 +574,37 @@ class ArmPolicyDeployNode(Node):
         if metrics["feed_reached"]:
             self.feed_stable_steps += 1
             if self.feed_stable_steps >= self.FEED_STABLE_STEPS_REQUIRED:
-                self.fsm_state = "DONE"
-                # 实机暂时没有球位置观测，因此用“勺心稳定入嘴”作为仿真球+勺成功条件的代理。
-                self.stop_episode("SUCCESS", "勺心在嘴内满足径向、深度和对齐条件并稳定保持。", spoon_center)
+                self.start_success_hold()
                 return True
         else:
             self.feed_stable_steps = 0
         return False
+
+    def start_success_hold(self) -> None:
+        self.fsm_state = "SUCCESS_HOLD"
+        self.success_hold_steps = 0
+        if self.current_joint_pos is not None:
+            self.success_hold_joint_pos = self.current_joint_pos.copy()
+            if not self.args.dry_run:
+                self.publish_joint_target(self.success_hold_joint_pos)
+        self.previous_arm_action = np.zeros(6, dtype=np.float32)
+        self.get_logger().warn(
+            "成功条件已连续稳定满足，进入成功后保持阶段: "
+            f"hold_steps={self.SUCCESS_HOLD_STEPS_AFTER_REACHED}"
+        )
+
+    def update_success_hold(self, spoon_center: np.ndarray) -> None:
+        self.success_hold_steps += 1
+        if self.success_hold_joint_pos is not None and not self.args.dry_run:
+            self.publish_joint_target(self.success_hold_joint_pos)
+        if self.success_hold_steps >= self.SUCCESS_HOLD_STEPS_AFTER_REACHED:
+            self.fsm_state = "DONE"
+            # 实机暂时没有球位置观测，因此用“勺心稳定入嘴”作为仿真球+勺成功条件的代理。
+            self.stop_episode(
+                "SUCCESS",
+                f"勺心入嘴成功后额外保持 {self.SUCCESS_HOLD_STEPS_AFTER_REACHED} 步，开始归位。",
+                spoon_center,
+            )
 
     def compute_fsm_metrics(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> dict[str, float | bool]:
         assert self.mouth_pos is not None
@@ -628,6 +665,21 @@ class ArmPolicyDeployNode(Node):
         )
         if not self.args.dry_run and self.current_joint_pos is not None:
             self.publish_joint_target(self.current_joint_pos)
+        if reason_type == "SUCCESS":
+            self.start_reset_after_success()
+
+    def start_reset_after_success(self) -> None:
+        if not self.RESET_AFTER_SUCCESS or self.args.dry_run or self.reset_started:
+            return
+        self.reset_started = True
+        reset_script = PROJECT_ROOT / "deploy" / "reset_arm.py"
+        cmd = [sys.executable, str(reset_script), "--execute"]
+        try:
+            subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
+        except OSError as exc:
+            self.get_logger().error(f"成功后启动归位失败: cmd={cmd}, error={exc}")
+            return
+        self.get_logger().warn(f"成功条件稳定满足，已启动自动归位: {' '.join(cmd)}")
 
     def lookup_ee_pose(self) -> tuple[np.ndarray, np.ndarray] | None:
         try:
@@ -1028,12 +1080,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--min-speed-scaling", type=float, default=0.01, help="Do not publish motion commands unless UR speed scaling is at least this value.")
     parser.add_argument("--episode-length-s", type=float, default=240.0, help="Deployment episode timeout in seconds, matching simulation.")
     parser.add_argument("--max-episode-steps", type=int, default=0, help="Deployment episode timeout in policy steps; <=0 uses episode_length_s * control_hz.")
-    parser.add_argument("--feed-distance", type=float, default=0.10, help=argparse.SUPPRESS)
     parser.add_argument("--withdraw-distance", type=float, default=0.10, help=argparse.SUPPRESS)
     parser.add_argument("--feed-hold-steps", type=int, default=5, help=argparse.SUPPRESS)
     parser.add_argument("--bite-release-steps", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--min-spoon-z", type=float, default=0.06, help="Episode failure threshold for spoon center height in target-frame meters.")
-    parser.add_argument("--max-mouth-spoon-distance", type=float, default=0.75, help="Episode failure threshold for mouth-spoon distance; <=0 disables this guard.")
+    parser.add_argument("--max-mouth-spoon-distance", type=float, default=3.00, help="Episode failure threshold for mouth-spoon distance; <=0 disables this guard.")
     parser.add_argument("--action-scale-arm", type=float, default=0.008, help="Scale from policy action to delta pose, matching simulation.")
     parser.add_argument("--action-limit", type=float, default=3.0, help="Clamp policy action before filtering and scaling, matching simulation.")
     parser.add_argument("--ik-damping", type=float, default=0.05, help="DLS IK damping.")
