@@ -93,6 +93,7 @@ class ArmPolicyDeployNode(Node):
     FEED_STABLE_STEPS_REQUIRED = 5
     SUCCESS_HOLD_STEPS_AFTER_REACHED = 30
     RESET_AFTER_SUCCESS = True
+    LATCH_FIRST_VISION_MOUTH_POSE = True
     ARM_ACTION_ROTATION_SCALE = 0.002  # 与仿真一致: 旋转增量小于平移增量，避免真机将策略姿态动作放大四倍。
     RESET_ACTION_FREEZE_STEPS = 10  # 与仿真一致: reset 后先冻结10个控制步，避免初始饱和动作立刻改变勺子姿态。
     RESET_ACTION_RAMP_STEPS = 12  # 与仿真一致: 冻结结束后用12步把实际位姿增量线性放大到完整值。
@@ -154,6 +155,7 @@ class ArmPolicyDeployNode(Node):
         self.wrench_record_count = 0
         self.last_joint_target: np.ndarray | None = None
         self.target_received = False
+        self.vision_mouth_pose_latched = False
         self.warned_missing_tf = False
         self.last_face_time_ns: int | None = None
         self.last_joint_state_time_ns: int | None = None
@@ -267,9 +269,19 @@ class ArmPolicyDeployNode(Node):
 
         pos = transformed.pose.position
         ori = transformed.pose.orientation
+        self.last_face_time_ns = self.get_clock().now().nanoseconds
+
+        if self.LATCH_FIRST_VISION_MOUTH_POSE and self.vision_mouth_pose_latched:
+            return
+
         self.mouth_pos = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
         self.mouth_quat_wxyz = quat_xyzw_to_wxyz(np.array([ori.x, ori.y, ori.z, ori.w], dtype=np.float32))
-        self.last_face_time_ns = self.get_clock().now().nanoseconds
+        if self.LATCH_FIRST_VISION_MOUTH_POSE:
+            self.vision_mouth_pose_latched = True
+            self.get_logger().info(
+                "已锁定第一帧视觉嘴巴目标，本 episode 后续视觉消息只刷新时间戳，不再改变 mouth_pos/mouth_axis: "
+                f"mouth_pos={np.round(self.mouth_pos, 4)}, mouth_axis={np.round(self.compute_mouth_axis(), 4)}"
+            )
         if not self.target_received:
             self.target_received = True
             self.get_logger().info("已接收到第一个人脸/嘴部目标，arm policy 开始参与控制。")
