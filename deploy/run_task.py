@@ -1,5 +1,6 @@
 import argparse
 import csv
+from collections import deque
 from datetime import datetime
 import math
 from pathlib import Path
@@ -7,6 +8,13 @@ import subprocess
 import sys
 
 import numpy as np
+try:
+    import cv2
+
+    _HAS_CV2 = True
+except Exception:
+    cv2 = None
+    _HAS_CV2 = False
 import rclpy
 from builtin_interfaces.msg import Duration
 from control_msgs.msg import JointTrajectoryControllerState
@@ -31,7 +39,9 @@ from python.utils.ur5e_kinematics import UR5eDLSIK, quat_apply_wxyz, quat_xyzw_t
 
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "sample/actor_agent_arm_torchscript.pt"
+DEFAULT_SAFETY_MODEL_PATH = PROJECT_ROOT / "sample/actor_agent_safety_torchscript.pt"
 WRENCH_RECORD_DIR = PROJECT_ROOT / "logs" / "wrench_records"
+SAFETY_GAIN_VIS_DIR = PROJECT_ROOT / "logs" / "safety_gain_visualization"
 
 
 class ArmPolicyDeployNode(Node):
@@ -68,6 +78,7 @@ class ArmPolicyDeployNode(Node):
     WRIST_FORCE_OBS_CLIP_N = 8.0
     WRIST_TORQUE_OBS_CLIP_NM = 1.0
     WRIST_WRENCH_FILTER_ALPHA = 0.2
+    WRENCH_SIM_REAL_SIGN = -1.0  # 力方向对齐: -1 表示实机传感器读数与仿真关节反力方向相反。
     # 固定嘴模式直接复用一帧真实仿真 OBS_DEBUG 样本，确保 mouth_pos/mouth_axis/6个嘴部观测点来自同一个可出现状态。
     DEFAULT_FIXED_MOUTH_POS = np.array([0.77805, 0.55456, 0.21979], dtype=np.float32)
     # DEFAULT_FIXED_MOUTH_POS = np.array([0.66026, 0.41026, 0.26], dtype=np.float32)
@@ -111,6 +122,69 @@ class ArmPolicyDeployNode(Node):
         ],
         dtype=np.float32,
     )
+    # 规则安全层配置集中写在代码里，实机调参时直接改这里，避免部署命令行越来越长。
+    # 开关与可视化: 控制规则层是否接管动作，以及是否显示/保存三通道增益图像。
+    RULE_SAFETY_ENABLED = False
+    SAFETY_GAIN_VISUALIZATION = True
+    SAVE_SAFETY_GAIN_IMAGES = True
+    SAFETY_GAIN_HISTORY = 300
+    SAFETY_GAIN_IMAGE_INTERVAL = 10
+    SAVE_FULL_SAFETY_GAIN_CURVE = True
+    SAFETY_GAIN_CURVE_DPI = 220
+
+    # 几何增益: 控制近嘴减速、横向居中和危险撤回在什么距离开始生效。
+    RULE_SAFETY_ZONE_DIST = 0.12
+    RULE_SLOW_START_DIST = 0.12
+    RULE_SLOW_FULL_DIST = 0.05
+    RULE_CENTER_START_DIST = 0.10
+    RULE_CENTER_FULL_DIST = 0.03
+    RULE_CENTER_DEADBAND = 0.006
+    RULE_CENTER_FULL_RADIAL = 0.035
+    RULE_LATERAL_STEP = 0.010
+    RULE_RETREAT_STEP = 0.012
+    RULE_RETREAT_START_DIST = 0.040
+    RULE_RETREAT_RELEASE_DIST = 0.080
+    RULE_MIN_RETREAT_GAIN = 0.45
+    RULE_MOUTH_CHANNEL_RADIUS = FEED_INSERT_RADIUS_M
+    RULE_MOUTH_CHANNEL_FRONT = 0.060
+    RULE_MOUTH_CHANNEL_BACK = 0.030
+
+    # 风险阈值: 控制嘴唇/嘴部连杆/腕部力觉何时触发减速或撤回。
+    RULE_LIP_MARGIN = 0.025
+    RULE_LINK_THRESHOLD = 0.018
+    RULE_FORCE_THRESHOLD_N = 8.0
+    RULE_FORCE_RELEASE_N = 5.0
+    RULE_TORQUE_THRESHOLD_NM = 0.8
+    RULE_AXIAL_FORCE_THRESHOLD_N = 4.0
+    RULE_TRIGGER_SCORE = 0.05
+    RULE_CLEAR_SCORE = 0.01
+
+    # 学习安全策略部署: 关闭规则安全后自动加载 27 维 safety actor，参数仍放在代码里便于实机调试。
+    LOAD_SAFETY_POLICY_WHEN_RULE_OFF = True
+    SAFETY_POLICY_MODEL_PATH = DEFAULT_SAFETY_MODEL_PATH
+    SAFETY_POLICY_OBS_DIM = 27
+    SAFETY_POLICY_ACTION_DIM = 3
+    SAFETY_POLICY_MOUTH_HOLE_RADIUS = 0.020
+    SAFETY_POLICY_MOUTH_CHANNEL_RADIUS = SAFETY_POLICY_MOUTH_HOLE_RADIUS * 1.25
+    SAFETY_POLICY_MOUTH_CHANNEL_FRONT = 0.050
+    SAFETY_POLICY_MOUTH_CHANNEL_BACK = 0.030
+    SAFETY_POLICY_LINK_THRESHOLD = 0.005
+    SAFETY_POLICY_FORCE_SOFT_LIMIT = 0.80
+    SAFETY_POLICY_TORQUE_SOFT_LIMIT = 0.80
+    SAFETY_POLICY_AX_FORCE_LIMIT = 0.50
+    SAFETY_POLICY_CLEAR_AXIAL_DIST = 0.150
+    SAFETY_POLICY_RESET_CLEARANCE = 0.75
+    SAFETY_POLICY_RETRACT_GAIN_MIN = 0.35
+    SAFETY_POLICY_RETREAT_STEP = RULE_RETREAT_STEP
+    SAFETY_POLICY_LATERAL_STEP = RULE_LATERAL_STEP
+    SAFETY_POLICY_FACE_PROXY_ENABLED = True
+    SAFETY_POLICY_FACE_PROXY_MIN_DEPTH = 0.0
+    SAFETY_POLICY_FACE_PROXY_START_DIST = 0.085
+    SAFETY_POLICY_FACE_PROXY_FULL_DIST = 0.010
+    # 安全语义速记:
+    # - lip_risk: 近嘴唇/入口边缘的减速信号，主要触发 slow / center，不直接进 RETREAT
+    # - face/link/force/poke: 直接触发 RETREAT 锁存
+    # - mouth_depth > 0: 才表示勺心沿嘴轴真正进入嘴内，成功门控也依赖这个正向 depth
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("arm_policy_deploy_node")
@@ -175,6 +249,49 @@ class ArmPolicyDeployNode(Node):
             if args.max_episode_steps > 0
             else max(1, int(round(args.episode_length_s * args.control_hz)))
         )
+        self.rule_safety_enabled = bool(self.RULE_SAFETY_ENABLED)
+        # 规则安全关闭时才启用学习 safety actor，避免同一帧同时出现两套 safety 接管逻辑。
+        self.learned_safety_enabled = bool(
+            self.LOAD_SAFETY_POLICY_WHEN_RULE_OFF and not self.rule_safety_enabled
+        )
+        self.safety_policy: HarlArmPolicy | None = None
+        if self.learned_safety_enabled:
+            self.safety_policy = HarlArmPolicy(
+                str(self.SAFETY_POLICY_MODEL_PATH),
+                obs_dim=self.SAFETY_POLICY_OBS_DIM,
+                action_dim=self.SAFETY_POLICY_ACTION_DIM,
+                device=args.device,
+                backend="auto",
+            )
+        self.previous_safety_action = np.zeros(self.SAFETY_POLICY_ACTION_DIM, dtype=np.float32)
+        self.safety_slow_active = False  # 学习 safety actor 复用仿真中的 slow flag，作为下一帧安全观测的一部分。
+        self.save_safety_gain_images = bool(self.SAVE_SAFETY_GAIN_IMAGES)
+        self.save_full_safety_gain_curve = bool(self.SAVE_FULL_SAFETY_GAIN_CURVE)
+        self.safety_gain_history_len = max(2, int(self.SAFETY_GAIN_HISTORY))
+        self.safety_gain_image_interval = max(1, int(self.SAFETY_GAIN_IMAGE_INTERVAL))
+        self.safety_gain_curve_rows: list[dict[str, float | str | bool]] = []  # 论文图: 保存完整 episode 的三增益和风险量，用于结束时画全程曲线。
+        self.safety_gain_curve_saved = False  # 论文图: 防止 stop_episode 和 Ctrl-C 清理时重复写同一条曲线。
+        self.rule_safety_retreat_active = False  # 规则/策略安全层共用: 危险触发后锁存撤回，直到净空和力觉都恢复安全。
+        self.rule_safety_retreat_steps = 0  # 规则/策略安全层共用: 统计连续撤回步数，便于图像面板显示当前安全接管时长。
+        self.rule_safety_last_state = self.default_rule_safety_state()  # 规则/策略安全层共用: 保存最近一次实际生效的三增益和风险指标。
+        self.safety_gain_history = {
+            "slow": deque(maxlen=self.safety_gain_history_len),
+            "center": deque(maxlen=self.safety_gain_history_len),
+            "retreat": deque(maxlen=self.safety_gain_history_len),
+        }  # 可视化: 三个增益分别保留短历史，用于绘制实时曲线。
+        self.safety_gain_window = "Safety Gains"
+        self.safety_gain_visualization_enabled = bool(self.SAFETY_GAIN_VISUALIZATION and _HAS_CV2)
+        if self.SAFETY_GAIN_VISUALIZATION and not _HAS_CV2:
+            self.get_logger().warn("未能导入 cv2，安全增益图像可视化将自动关闭。")
+        if self.safety_gain_visualization_enabled:
+            try:
+                cv2.namedWindow(self.safety_gain_window, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self.safety_gain_window, 760, 460)
+            except Exception as exc:
+                self.safety_gain_visualization_enabled = False
+                self.get_logger().warn(f"无法创建安全增益可视化窗口，已关闭图像显示: {exc}")
+        if self.save_safety_gain_images or self.save_full_safety_gain_curve:
+            SAFETY_GAIN_VIS_DIR.mkdir(parents=True, exist_ok=True)
 
         if args.fixed_mouth_pose:
             self.mouth_pos = self.DEFAULT_FIXED_MOUTH_POS.copy()
@@ -213,6 +330,31 @@ class ArmPolicyDeployNode(Node):
             f"freeze={self.RESET_ACTION_FREEZE_STEPS} steps, "
             f"ramp={self.RESET_ACTION_RAMP_STEPS} steps"
         )
+        if self.rule_safety_enabled:
+            self.get_logger().info(
+                "规则安全层已启用: "
+                f"slow=[{self.RULE_SLOW_FULL_DIST:.3f}, {self.RULE_SLOW_START_DIST:.3f}]m, "
+                f"center=[{self.RULE_CENTER_FULL_DIST:.3f}, {self.RULE_CENTER_START_DIST:.3f}]m, "
+                f"retreat_step={self.RULE_RETREAT_STEP:.3f}m；"
+                "安全增益会在策略 arm_delta 后、IK 前生效。"
+            )
+        elif self.learned_safety_enabled:
+            assert self.safety_policy is not None
+            self.get_logger().info(
+                "规则安全层已关闭，改用学习 safety actor: "
+                f"obs_dim={self.SAFETY_POLICY_OBS_DIM}, action_dim={self.SAFETY_POLICY_ACTION_DIM}, "
+                f"retreat_step={self.SAFETY_POLICY_RETREAT_STEP:.3f}m, "
+                f"lateral_step={self.SAFETY_POLICY_LATERAL_STEP:.3f}m。"
+            )
+            self.get_logger().info(f"safety policy request: {Path(self.SAFETY_POLICY_MODEL_PATH).expanduser().resolve()}")
+            self.get_logger().info(f"safety policy loaded: {self.safety_policy.loaded_path}")
+            self.get_logger().info(f"safety policy backend: {self.safety_policy.backend}")
+            self.get_logger().info(
+                "safety policy输入为27维: 嘴局部几何 + 风险量 + 阶段flag + 上一步safety动作；"
+                "实机暂无完整face点云时，face_intrusion_risk先由6个嘴部特征点近似。"
+            )
+        else:
+            self.get_logger().warn("规则安全层和学习 safety actor 均未启用: arm_delta 将不经过 near-mouth safety filter。")
         self.get_logger().info(
             "arm policy输入为58维: 52维运动学观测 + 6维腕部force/torque；"
             "wrench使用8N/1Nm模长限幅、仿真同款缩放和alpha=0.2低通。"
@@ -397,6 +539,23 @@ class ArmPolicyDeployNode(Node):
                     "arm_delta_rx",
                     "arm_delta_ry",
                     "arm_delta_rz",
+                    "policy_arm_delta_x",
+                    "policy_arm_delta_y",
+                    "policy_arm_delta_z",
+                    "policy_arm_delta_rx",
+                    "policy_arm_delta_ry",
+                    "policy_arm_delta_rz",
+                    "safety_mode",
+                    "safety_slow_gain",
+                    "safety_center_gain",
+                    "safety_retreat_gain",
+                    "safety_danger_score",
+                    "safety_spoon_radial",
+                    "safety_mouth_depth",
+                    "safety_force_norm",
+                    "safety_axial_force",
+                    "safety_signed_axial_force",
+                    "safety_wrench_sign",
                 ]
             )
             self.get_logger().info(f"真实运行 wrench CSV 记录: {path}")
@@ -412,10 +571,16 @@ class ArmPolicyDeployNode(Node):
         policy_action: np.ndarray,
         command_action: np.ndarray,
         arm_delta: np.ndarray,
+        safety_state: dict[str, object] | None = None,
+        policy_arm_delta: np.ndarray | None = None,
     ) -> None:
         if self.wrench_record_writer is None:
             return
         assert self.mouth_pos is not None
+        if safety_state is None:
+            safety_state = self.default_rule_safety_state()
+        if policy_arm_delta is None:
+            policy_arm_delta = np.asarray(arm_delta, dtype=np.float32)
         if self.episode_start_time_ns is None:
             time_s = 0.0
         else:
@@ -434,6 +599,20 @@ class ArmPolicyDeployNode(Node):
             + np.asarray(policy_action, dtype=np.float32).astype(float).tolist()
             + np.asarray(command_action, dtype=np.float32).astype(float).tolist()
             + np.asarray(arm_delta, dtype=np.float32).astype(float).tolist()
+            + np.asarray(policy_arm_delta, dtype=np.float32).astype(float).tolist()
+            + [
+                str(safety_state["mode"]),
+                float(safety_state["slow_gain"]),
+                float(safety_state["center_gain"]),
+                float(safety_state["retreat_gain"]),
+                float(safety_state["danger_score"]),
+                float(safety_state["spoon_radial"]),
+                float(safety_state["mouth_depth"]),
+                float(safety_state["force_norm"]),
+                float(safety_state["axial_force"]),
+                float(safety_state["signed_axial_force"]),
+                float(safety_state["wrench_sign"]),
+            ]
         )
         self.wrench_record_writer.writerow(row)
         self.wrench_record_count += 1
@@ -447,6 +626,979 @@ class ArmPolicyDeployNode(Node):
         self.wrench_record_file.close()
         self.wrench_record_file = None
         self.wrench_record_writer = None
+
+    def default_rule_safety_state(self) -> dict[str, float | str | bool]:
+        """生成安全层的默认状态，供未启用或尚未运行时的日志和可视化使用。"""
+        return {
+            "mode": "OFF",
+            "slow_gain": 0.0,
+            "center_gain": 0.0,
+            "retreat_gain": 0.0,
+            "danger_score": 0.0,
+            "lip_risk": 0.0,
+            "link_risk": 0.0,
+            "force_risk": 0.0,
+            "poke_risk": 0.0,
+            "spoon_mouth_dist": 0.0,
+            "spoon_radial": 0.0,
+            "mouth_depth": 0.0,
+            "force_norm": 0.0,
+            "torque_norm": 0.0,
+            "axial_force": 0.0,
+            "signed_axial_force": 0.0,
+            "wrench_sign": 0.0,
+            "safe_clearance": 0.0,
+            "retreat_active": False,
+            "retreat_steps": 0,
+            "inside_mouth_channel": False,
+            "safety_zone": False,
+            "policy_delta_norm": 0.0,
+            "final_delta_norm": 0.0,
+        }
+
+    @staticmethod
+    def normalize_vector(vector: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
+        """把向量归一化，退化时使用 fallback，避免安全方向出现 NaN。"""
+        vector = np.asarray(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        if norm > 1.0e-6:
+            return (vector / norm).astype(np.float32)
+        if fallback is None:
+            fallback = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        return np.asarray(fallback, dtype=np.float32).copy()
+
+    @staticmethod
+    def inverse_ramp(value: float, start: float, full: float) -> float:
+        """把越小越危险的距离映射到 0~1，start 外为 0，full 内为 1。"""
+        if start <= full:
+            return float(value <= full)
+        return float(np.clip((start - value) / max(start - full, 1.0e-6), 0.0, 1.0))
+
+    def build_mouth_axis_frame(self, mouth_axis: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """围绕嘴巴开口轴构造局部坐标系，用于计算横向偏心和轴向深度。"""
+        z_axis = self.normalize_vector(mouth_axis, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+        ref = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        if abs(float(np.dot(ref, z_axis))) > 0.90:
+            ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        x_axis = self.normalize_vector(np.cross(ref, z_axis), np.array([0.0, 1.0, 0.0], dtype=np.float32))
+        y_axis = self.normalize_vector(np.cross(z_axis, x_axis), np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        return x_axis, y_axis, z_axis
+
+    def compute_safety_stage_flags(self) -> dict[str, float]:
+        """把实机简化任务的 FSM 状态映射到 safety actor 训练时保留的阶段槽位。"""
+        feed_reached = bool(self.last_fsm_metrics.get("feed_reached", False))
+        entered_or_holding = feed_reached or self.feed_stable_steps > 0 or self.fsm_state in {"SUCCESS_HOLD", "DONE"}
+        # 实机当前没有球/咬合/撤出观测，兼容旧槽位时只保留“已经入嘴”和“当前成功”两个可构建信号。
+        return {
+            "stage_entered": float(entered_or_holding),
+            "stage_bite": 0.0,
+            "withdraw_done": 0.0,
+            "full_success": float(feed_reached or self.fsm_state in {"SUCCESS_HOLD", "DONE"}),
+        }
+
+    def compute_safety_policy_state(
+        self,
+        ee_quat_wxyz: np.ndarray,
+        spoon_center: np.ndarray,
+    ) -> dict[str, object]:
+        """构建与仿真 _compute_safety_state 对齐的实机安全状态，供 learning safety actor 使用。"""
+        assert self.mouth_pos is not None
+        assert self.mouth_quat_wxyz is not None
+
+        stage_flags = self.compute_safety_stage_flags()
+        spoon_rel_w = np.nan_to_num(spoon_center - self.mouth_pos, nan=0.0, posinf=5.0, neginf=-5.0)
+        # run_task 中的 mouth_quat 来自真实视觉约定，compute_mouth_axis() 才是已经对齐仿真策略观测的嘴巴开口轴。
+        mouth_axis_w = self.normalize_vector(self.compute_mouth_axis(), np.array([1.0, 0.0, 0.0], dtype=np.float32))
+        mouth_x, mouth_y, mouth_z = self.build_mouth_axis_frame(mouth_axis_w)
+        spoon_rel_local = np.array(
+            [
+                float(np.dot(spoon_rel_w, mouth_x)),
+                float(np.dot(spoon_rel_w, mouth_y)),
+                float(np.dot(spoon_rel_w, mouth_z)),
+            ],
+            dtype=np.float32,
+        )
+        spoon_rel_local = np.nan_to_num(spoon_rel_local, nan=0.0, posinf=5.0, neginf=-5.0)
+        retract_dir_w = -mouth_axis_w
+        retract_dir_local = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        spoon_dir_w = self.normalize_vector(
+            quat_apply_wxyz(ee_quat_wxyz, self.SPOON_FORWARD_AXIS_LOCAL),
+            mouth_axis_w,
+        )
+
+        spoon_radial = float(np.linalg.norm(spoon_rel_local[:2]))
+        spoon_mouth_dist = float(np.linalg.norm(spoon_rel_local))
+        mouth_depth = float(spoon_rel_local[2])
+        inside_mouth_channel = (
+            spoon_radial < float(self.SAFETY_POLICY_MOUTH_CHANNEL_RADIUS)
+            and mouth_depth > -float(self.SAFETY_POLICY_MOUTH_CHANNEL_BACK)
+            and mouth_depth < float(self.SAFETY_POLICY_MOUTH_CHANNEL_FRONT)
+        )
+        safety_zone = (
+            spoon_mouth_dist < float(self.RULE_SAFETY_ZONE_DIST)
+            or inside_mouth_channel
+            or stage_flags["stage_entered"] > 0.5
+        )
+        pre_insert = stage_flags["stage_entered"] <= 0.5
+
+        lateral_to_center_local = np.array([-spoon_rel_local[0], -spoon_rel_local[1], 0.0], dtype=np.float32)
+        lateral_to_center_local = self.normalize_vector(lateral_to_center_local, np.zeros(3, dtype=np.float32))
+        lateral_to_center_w = (
+            lateral_to_center_local[0] * mouth_x
+            + lateral_to_center_local[1] * mouth_y
+            + lateral_to_center_local[2] * mouth_z
+        ).astype(np.float32)
+
+        # lip_risk 关注两件事:
+        # 1) spoon_radial 是否贴近嘴孔半径
+        # 2) mouth_depth 是否接近 0，也就是还在嘴唇入口附近
+        # 它用于近嘴减速/居中，不是 learned safety 的直接撤回条件。
+        lip_gap = abs(spoon_radial - float(self.SAFETY_POLICY_MOUTH_HOLE_RADIUS))
+        lip_z = abs(mouth_depth)
+        lip_risk = (
+            float(np.clip(1.0 - lip_gap / max(float(self.RULE_LIP_MARGIN), 1.0e-6), 0.0, 1.0))
+            * float(np.clip(1.0 - lip_z / max(float(self.SAFETY_POLICY_MOUTH_CHANNEL_FRONT), 1.0e-6), 0.0, 1.0))
+            * float(pre_insert)
+        )
+
+        mouth_feature_points = self.build_mouth_feature_points()
+        feature_dists = np.linalg.norm(mouth_feature_points - spoon_center.reshape(1, 3), axis=1)
+        min_feature_dist = float(np.min(feature_dists)) if feature_dists.size > 0 else float("inf")
+        # 这个阈值是“预入嘴阶段的嘴部连杆/点云接触”判断，满足就直接算 hazard -> RETREAT。
+        linkage_contact_before_insert = bool(min_feature_dist < float(self.SAFETY_POLICY_LINK_THRESHOLD) and pre_insert)
+        linkage_intrusion_risk = (
+            float(np.clip((float(self.SAFETY_POLICY_LINK_THRESHOLD) - min_feature_dist) / max(float(self.SAFETY_POLICY_LINK_THRESHOLD), 1.0e-6), 0.0, 1.0))
+            * float(linkage_contact_before_insert)
+        )
+
+        # coarse face proxy: 这里比 lip_risk 更像“已经碰到脸/口周区域”的撤回信号，
+        # 只在嘴前方且不在 mouth channel 内时启用。
+        face_intrusion_risk = 0.0
+        inside_face_proxy = False
+        if (
+            self.SAFETY_POLICY_FACE_PROXY_ENABLED
+            and feature_dists.size > 0
+            and safety_zone
+            and not inside_mouth_channel
+            and mouth_depth > float(self.SAFETY_POLICY_FACE_PROXY_MIN_DEPTH)
+        ):
+            face_intrusion_risk = self.inverse_ramp(
+                min_feature_dist,
+                float(self.SAFETY_POLICY_FACE_PROXY_START_DIST),
+                float(self.SAFETY_POLICY_FACE_PROXY_FULL_DIST),
+            )
+            inside_face_proxy = face_intrusion_risk > 0.0
+
+        policy_wrench = np.nan_to_num(self.wrist_wrench_policy_obs, nan=0.0, posinf=5.0, neginf=-5.0)
+        force_obs = policy_wrench[:3].astype(np.float32)
+        torque_obs = policy_wrench[3:].astype(np.float32)
+        force_obs_norm = float(np.linalg.norm(force_obs))
+        torque_obs_norm = float(np.linalg.norm(torque_obs))
+        force_obs_w = quat_apply_wxyz(ee_quat_wxyz, force_obs)
+        ax_force_obs = abs(float(np.dot(force_obs_w, spoon_dir_w)))
+        # 力觉风险: 过大的腕力/力矩、或沿勺前进方向的异常轴向力。
+        force_risk = (
+            float(np.clip((force_obs_norm - float(self.SAFETY_POLICY_FORCE_SOFT_LIMIT)) / max(float(self.SAFETY_POLICY_FORCE_SOFT_LIMIT), 1.0e-6), 0.0, 1.0))
+            + 0.5
+            * float(np.clip((torque_obs_norm - float(self.SAFETY_POLICY_TORQUE_SOFT_LIMIT)) / max(float(self.SAFETY_POLICY_TORQUE_SOFT_LIMIT), 1.0e-6), 0.0, 1.0))
+        )
+        force_risk = float(np.clip(force_risk, 0.0, 1.0)) * float(safety_zone) * float(pre_insert)
+        # poke_risk: 轴向顶入过大时触发，通常比 lip_risk 更接近“戳入喉咙”的语义。
+        poke_risk = (
+            float(np.clip((ax_force_obs - float(self.SAFETY_POLICY_AX_FORCE_LIMIT)) / max(float(self.SAFETY_POLICY_AX_FORCE_LIMIT), 1.0e-6), 0.0, 1.0))
+            * float(pre_insert)
+            * float(safety_zone)
+        )
+
+        safety_wrench_raw = self.get_sim_aligned_safety_wrench_raw()
+        force_norm = float(np.linalg.norm(safety_wrench_raw[:3]))
+        torque_norm = float(np.linalg.norm(safety_wrench_raw[3:]))
+        raw_force_w = quat_apply_wxyz(ee_quat_wxyz, safety_wrench_raw[:3].astype(np.float32))
+        signed_axial_force = float(np.dot(raw_force_w, spoon_dir_w))
+        axial_force = abs(signed_axial_force)
+        safe_clearance = max(float(np.dot(spoon_rel_w, retract_dir_w)), 0.0)
+        safe_clearance_norm = float(
+            np.clip(safe_clearance / max(float(self.SAFETY_POLICY_CLEAR_AXIAL_DIST), 1.0e-6), 0.0, 1.0)
+        )
+        danger_score = float(
+            np.clip(max(face_intrusion_risk, linkage_intrusion_risk, force_risk, poke_risk), 0.0, 1.0)
+        )
+
+        return {
+            "mode": "TRACK",
+            "slow_gain": 0.0,
+            "center_gain": 0.0,
+            "retreat_gain": 0.0,
+            "danger_score": danger_score,
+            "lip_risk": float(lip_risk),
+            "face_intrusion_risk": float(face_intrusion_risk),
+            "link_risk": float(linkage_intrusion_risk),
+            "linkage_intrusion_risk": float(linkage_intrusion_risk),
+            "force_risk": float(force_risk),
+            "poke_risk": float(poke_risk),
+            "spoon_mouth_dist": spoon_mouth_dist,
+            "spoon_radial": spoon_radial,
+            "mouth_depth": mouth_depth,
+            "force_norm": force_norm,
+            "torque_norm": torque_norm,
+            "axial_force": axial_force,
+            "signed_axial_force": signed_axial_force,
+            "wrench_sign": float(self.wrench_sign),
+            "safe_clearance": safe_clearance,
+            "safe_clearance_norm": safe_clearance_norm,
+            "retreat_active": bool(self.rule_safety_retreat_active),
+            "retreat_steps": int(self.rule_safety_retreat_steps),
+            "inside_mouth_channel": bool(inside_mouth_channel),
+            "inside_face_proxy": bool(inside_face_proxy),
+            "linkage_contact_before_insert": bool(linkage_contact_before_insert),
+            "safety_zone": bool(safety_zone),
+            "policy_delta_norm": 0.0,
+            "final_delta_norm": 0.0,
+            "spoon_rel_local": spoon_rel_local,
+            "retract_dir_local": retract_dir_local,
+            "retract_dir_w": retract_dir_w,
+            "spoon_dir_w": spoon_dir_w,
+            "mouth_axis_w": mouth_axis_w,
+            "lateral_to_center_w": lateral_to_center_w,
+            **stage_flags,
+        }
+
+    def compute_safety_policy_observation(self, safety_state: dict[str, object]) -> np.ndarray:
+        """按仿真 obs_safety_policy 的 27 维顺序拼接实机 safety actor 观测。"""
+        scalar_obs = np.array(
+            [
+                float(safety_state["lip_risk"]),
+                float(safety_state["face_intrusion_risk"]),
+                float(safety_state["linkage_intrusion_risk"]),
+                float(safety_state["force_risk"]),
+                float(safety_state["poke_risk"]),
+                float(safety_state["safe_clearance_norm"]),
+                float(safety_state["stage_entered"]),
+                float(safety_state["stage_bite"]),
+                float(safety_state["withdraw_done"]),
+                float(safety_state["full_success"]),
+                float(self.safety_slow_active),
+                float(self.rule_safety_retreat_active),
+            ],
+            dtype=np.float32,
+        )
+        obs = np.concatenate(
+            [
+                np.asarray(safety_state["spoon_rel_local"], dtype=np.float32).reshape(3),
+                np.asarray(safety_state["retract_dir_local"], dtype=np.float32).reshape(3),
+                np.asarray(safety_state["spoon_dir_w"], dtype=np.float32).reshape(3),
+                np.asarray(safety_state["mouth_axis_w"], dtype=np.float32).reshape(3),
+                scalar_obs,
+                self.previous_safety_action.astype(np.float32).reshape(self.SAFETY_POLICY_ACTION_DIM),
+            ],
+            dtype=np.float32,
+        )
+        if obs.size != self.SAFETY_POLICY_OBS_DIM:
+            raise RuntimeError(f"safety观测维度错误: expected={self.SAFETY_POLICY_OBS_DIM}, actual={obs.size}")
+        return np.clip(np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0), -5.0, 5.0)
+
+    def learned_safety_hazard_now(self, safety_state: dict[str, object]) -> bool:
+        """复现仿真 safety hazard mask，决定学习增益是否进入撤回锁存。"""
+        # 这里是“直接进入 RETREAT”的四类 hazard。
+        # lip_risk 不在这里，它只会在后面的 slow_hazard 里触发减速/居中。
+        face_hazard = (
+            bool(safety_state["safety_zone"])
+            and not bool(safety_state["inside_mouth_channel"])
+            and float(safety_state["face_intrusion_risk"]) > float(self.RULE_TRIGGER_SCORE)
+        )
+        link_hazard = bool(safety_state["linkage_contact_before_insert"])
+        force_hazard = float(safety_state["force_risk"]) > float(self.RULE_TRIGGER_SCORE)
+        poke_hazard = float(safety_state["poke_risk"]) > float(self.RULE_TRIGGER_SCORE)
+        return bool(face_hazard or link_hazard or force_hazard or poke_hazard)
+
+    def apply_learned_safety_filter(
+        self,
+        ee_pos: np.ndarray,
+        ee_quat_wxyz: np.ndarray,
+        spoon_center: np.ndarray,
+        arm_delta: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        """关闭规则安全后，使用学习 safety actor 输出的三通道增益融合 arm_delta。"""
+        del ee_pos  # 学习 safety 观测以勺心和嘴局部几何为主，ee_pos 由外层 delta safety 继续检查。
+        arm_delta = np.asarray(arm_delta, dtype=np.float32).copy()
+        if not self.learned_safety_enabled or self.safety_policy is None or self.mouth_pos is None:
+            safety_state = self.default_rule_safety_state()
+            safety_state["policy_delta_norm"] = float(np.linalg.norm(arm_delta[:3]))
+            safety_state["final_delta_norm"] = float(np.linalg.norm(arm_delta[:3]))
+            self.previous_safety_action.fill(0.0)
+            self.safety_slow_active = False
+            self.rule_safety_last_state = safety_state
+            return arm_delta, safety_state
+
+        safety_state = self.compute_safety_policy_state(ee_quat_wxyz, spoon_center)
+        safety_obs = self.compute_safety_policy_observation(safety_state)
+        raw_safety_action = np.asarray(self.safety_policy.act(safety_obs), dtype=np.float32).reshape(-1)
+        if raw_safety_action.size != self.SAFETY_POLICY_ACTION_DIM:
+            raise RuntimeError(
+                f"safety policy 动作维度错误: expected={self.SAFETY_POLICY_ACTION_DIM}, actual={raw_safety_action.size}"
+            )
+        safety_action = np.clip(raw_safety_action, -1.0, 1.0).astype(np.float32)
+        safety_gain = np.clip((safety_action + 1.0) * 0.5, 0.0, 1.0)
+        safety_slow_gain = float(safety_gain[0])
+        safety_ret_gain = float(safety_gain[1])
+        safety_lateral_gain = float(safety_gain[2])
+
+        hazard_now = self.learned_safety_hazard_now(safety_state)
+        if hazard_now:
+            self.rule_safety_retreat_active = True
+        elif self.rule_safety_retreat_active:
+            retreat_clear = float(safety_state["safe_clearance_norm"]) > float(self.SAFETY_POLICY_RESET_CLEARANCE)
+            risk_clear = float(safety_state["danger_score"]) < float(self.RULE_CLEAR_SCORE)
+            proxy_clear = not bool(safety_state["inside_face_proxy"]) and not bool(safety_state["linkage_contact_before_insert"])
+            if retreat_clear and risk_clear and proxy_clear:
+                self.rule_safety_retreat_active = False
+
+        # lip_risk 只负责减速/居中，不会单独把状态打进 RETREAT。
+        slow_hazard = float(safety_state["lip_risk"]) > float(self.RULE_TRIGGER_SCORE) and not hazard_now
+        self.safety_slow_active = bool(slow_hazard and not self.rule_safety_retreat_active)
+        if self.rule_safety_retreat_active:
+            self.rule_safety_retreat_steps += 1
+        else:
+            self.rule_safety_retreat_steps = 0
+
+        arm_lin = arm_delta[:3].copy()
+        lin_norm = float(np.linalg.norm(arm_lin))
+        retract_dir_w = np.asarray(safety_state["retract_dir_w"], dtype=np.float32).reshape(3)
+        fwd_dir = -retract_dir_w
+        fwd_mag = max(float(np.dot(arm_lin, fwd_dir)), 0.0)
+        lateral_need = float(
+            np.clip(
+                (float(safety_state["spoon_radial"]) - float(self.SAFETY_POLICY_MOUTH_HOLE_RADIUS) * 0.5)
+                / max(float(self.RULE_LIP_MARGIN), 1.0e-6),
+                0.0,
+                1.0,
+            )
+        )
+        lateral_risk = max(
+            float(safety_state["lip_risk"]),
+            float(safety_state["face_intrusion_risk"]),
+            float(safety_state["linkage_intrusion_risk"]),
+        )
+        lateral_gain = (
+            safety_lateral_gain
+            * max(lateral_need, lateral_risk)
+            * float(bool(safety_state["safety_zone"]))
+        )
+        lateral_vec = (
+            np.asarray(safety_state["lateral_to_center_w"], dtype=np.float32).reshape(3)
+            * (float(self.SAFETY_POLICY_LATERAL_STEP) * lateral_gain)
+        )
+        slow_gain = float(
+            np.clip((0.25 + 0.75 * safety_slow_gain) * float(safety_state["lip_risk"]), 0.0, 0.95)
+        )
+
+        effective_slow_gain = 0.0
+        effective_center_gain = 0.0
+        effective_retreat_gain = 0.0
+        mode = "TRACK"
+        if self.rule_safety_retreat_active:
+            effective_retreat_gain = max(safety_ret_gain, float(self.SAFETY_POLICY_RETRACT_GAIN_MIN))
+            effective_center_gain = lateral_gain
+            arm_lin = retract_dir_w * (float(self.SAFETY_POLICY_RETREAT_STEP) * effective_retreat_gain) + lateral_vec
+            arm_delta[3:] = 0.0
+            mode = "RETREAT"
+        elif self.safety_slow_active:
+            effective_slow_gain = slow_gain
+            effective_center_gain = lateral_gain
+            arm_lin = arm_lin - effective_slow_gain * fwd_mag * fwd_dir + lateral_vec
+            if effective_center_gain > 0.05 and effective_slow_gain > 0.05:
+                mode = "SLOW_CENTER"
+            elif effective_center_gain > 0.05:
+                mode = "CENTER"
+            else:
+                mode = "SLOW"
+
+        # 学习策略只给增益，实机实际位移仍走 max_cartesian_step 保护，避免 safety 补偿绕过原有硬边界。
+        filtered_norm = float(np.linalg.norm(arm_lin))
+        if filtered_norm > float(self.args.max_cartesian_step):
+            arm_lin = arm_lin * (float(self.args.max_cartesian_step) / max(filtered_norm, 1.0e-6))
+            filtered_norm = float(np.linalg.norm(arm_lin))
+        arm_delta[:3] = arm_lin.astype(np.float32)
+
+        safety_state.update(
+            {
+                "mode": mode,
+                "slow_gain": float(effective_slow_gain),
+                "center_gain": float(effective_center_gain),
+                "retreat_gain": float(effective_retreat_gain),
+                "retreat_active": bool(self.rule_safety_retreat_active),
+                "retreat_steps": int(self.rule_safety_retreat_steps),
+                "policy_delta_norm": lin_norm,
+                "final_delta_norm": filtered_norm,
+            }
+        )
+        self.previous_safety_action = safety_action.copy()
+        self.rule_safety_last_state = safety_state
+        self.record_safety_gain_curve_sample(safety_state)
+        self.update_safety_gain_visualization(safety_state)
+        return arm_delta, safety_state
+
+    def apply_rule_based_safety_filter(
+        self,
+        ee_pos: np.ndarray,
+        ee_quat_wxyz: np.ndarray,
+        spoon_center: np.ndarray,
+        arm_delta: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, float | str | bool]]:
+        """在策略 arm_delta 之后施加确定性安全规则，模拟 safety agent 的三通道增益。"""
+        arm_delta = np.asarray(arm_delta, dtype=np.float32).copy()
+        if not self.rule_safety_enabled or self.mouth_pos is None:
+            safety_state = self.default_rule_safety_state()
+            safety_state["policy_delta_norm"] = float(np.linalg.norm(arm_delta[:3]))
+            safety_state["final_delta_norm"] = float(np.linalg.norm(arm_delta[:3]))
+            self.rule_safety_last_state = safety_state
+            return arm_delta, safety_state
+
+        mouth_axis = self.normalize_vector(self.compute_mouth_axis(), np.array([1.0, 0.0, 0.0], dtype=np.float32))
+        mouth_x, mouth_y, mouth_z = self.build_mouth_axis_frame(mouth_axis)
+        rel_spoon = np.nan_to_num(spoon_center - self.mouth_pos, nan=0.0, posinf=5.0, neginf=-5.0)
+        spoon_local = np.array(
+            [
+                float(np.dot(rel_spoon, mouth_x)),
+                float(np.dot(rel_spoon, mouth_y)),
+                float(np.dot(rel_spoon, mouth_z)),
+            ],
+            dtype=np.float32,
+        )
+        spoon_radial_vec_w = spoon_local[0] * mouth_x + spoon_local[1] * mouth_y
+        spoon_radial = float(np.linalg.norm(spoon_radial_vec_w))
+        spoon_mouth_dist = float(np.linalg.norm(rel_spoon))
+        mouth_depth = float(spoon_local[2])
+        lateral_to_center_w = (
+            -spoon_radial_vec_w / max(spoon_radial, 1.0e-6)
+            if spoon_radial > 1.0e-6
+            else np.zeros(3, dtype=np.float32)
+        )
+
+        channel_radius = float(self.RULE_MOUTH_CHANNEL_RADIUS)
+        inside_mouth_channel = (
+            spoon_radial < channel_radius
+            and mouth_depth > -float(self.RULE_MOUTH_CHANNEL_BACK)
+            and mouth_depth < float(self.RULE_MOUTH_CHANNEL_FRONT)
+        )
+        safety_zone = spoon_mouth_dist < float(self.RULE_SAFETY_ZONE_DIST) or inside_mouth_channel
+
+        # lip_risk 只表示接近嘴唇环带的预防性减速需求，不直接等同于必须撤回。
+        lip_gap = abs(spoon_radial - channel_radius)
+        lip_z = abs(mouth_depth)
+        lip_risk = (
+            self.inverse_ramp(lip_gap, float(self.RULE_LIP_MARGIN), 0.0)
+            * self.inverse_ramp(lip_z, float(self.RULE_MOUTH_CHANNEL_FRONT), 0.0)
+            * float(safety_zone)
+        )
+
+        mouth_feature_points = self.build_mouth_feature_points()
+        feature_dists = np.linalg.norm(mouth_feature_points - spoon_center.reshape(1, 3), axis=1)
+        min_feature_dist = float(np.min(feature_dists)) if feature_dists.size > 0 else float("inf")
+        link_risk = (
+            self.inverse_ramp(min_feature_dist, float(self.RULE_LINK_THRESHOLD), 0.0)
+            * float(not inside_mouth_channel)
+            * float(safety_zone)
+        )
+
+        safety_wrench_raw = self.get_sim_aligned_safety_wrench_raw()
+        force_norm = float(np.linalg.norm(safety_wrench_raw[:3]))
+        torque_norm = float(np.linalg.norm(safety_wrench_raw[3:]))
+        spoon_axis_w = self.normalize_vector(
+            quat_apply_wxyz(ee_quat_wxyz, self.SPOON_FORWARD_AXIS_LOCAL),
+            mouth_axis,
+        )
+        # safety 与策略共用仿真方向约定的 wrench，避免实机传感器作用力方向和仿真关节反力方向相反时把轴向戳碰判反。
+        force_w = quat_apply_wxyz(ee_quat_wxyz, safety_wrench_raw[:3].astype(np.float32))
+        signed_axial_force = float(np.dot(force_w, spoon_axis_w))
+        axial_force = abs(signed_axial_force)
+        force_risk = float(np.clip((force_norm - float(self.RULE_FORCE_THRESHOLD_N)) / max(float(self.RULE_FORCE_THRESHOLD_N), 1.0e-6), 0.0, 1.0))
+        torque_risk = float(np.clip((torque_norm - float(self.RULE_TORQUE_THRESHOLD_NM)) / max(float(self.RULE_TORQUE_THRESHOLD_NM), 1.0e-6), 0.0, 1.0))
+        force_risk = max(force_risk, 0.5 * torque_risk)
+        poke_risk = float(np.clip((axial_force - float(self.RULE_AXIAL_FORCE_THRESHOLD_N)) / max(float(self.RULE_AXIAL_FORCE_THRESHOLD_N), 1.0e-6), 0.0, 1.0))
+        force_risk *= float(safety_zone)
+        poke_risk *= float(safety_zone)
+        danger_score = float(np.clip(max(link_risk, force_risk, poke_risk), 0.0, 1.0))
+
+        lin_delta = arm_delta[:3].copy()
+        lin_norm = float(np.linalg.norm(lin_delta))
+        inward_dir_w = mouth_axis
+        retract_dir_w = -mouth_axis
+        inward_mag = max(float(np.dot(lin_delta, inward_dir_w)), 0.0)
+        inward_ratio = inward_mag / max(lin_norm, 1.0e-6)
+
+        slow_near_gain = self.inverse_ramp(
+            spoon_mouth_dist,
+            float(self.RULE_SLOW_START_DIST),
+            float(self.RULE_SLOW_FULL_DIST),
+        )
+        slow_gain = max(slow_near_gain, lip_risk)
+        slow_gain = float(np.clip(slow_gain * (0.35 + 0.65 * inward_ratio) * float(safety_zone), 0.0, 0.95))
+
+        radial_need = float(
+            np.clip(
+                (spoon_radial - float(self.RULE_CENTER_DEADBAND))
+                / max(float(self.RULE_CENTER_FULL_RADIAL) - float(self.RULE_CENTER_DEADBAND), 1.0e-6),
+                0.0,
+                1.0,
+            )
+        )
+        center_near_gain = self.inverse_ramp(
+            spoon_mouth_dist,
+            float(self.RULE_CENTER_START_DIST),
+            float(self.RULE_CENTER_FULL_DIST),
+        )
+        center_gain = float(np.clip(center_near_gain * radial_need * float(safety_zone), 0.0, 1.0))
+
+        geometry_danger = (
+            safety_zone
+            and spoon_mouth_dist < float(self.RULE_RETREAT_START_DIST)
+            and not inside_mouth_channel
+        )
+        hazard_now = danger_score >= float(self.RULE_TRIGGER_SCORE) or geometry_danger
+        safe_clearance = max(float(np.dot(rel_spoon, retract_dir_w)), 0.0)
+        if hazard_now:
+            self.rule_safety_retreat_active = True
+        elif self.rule_safety_retreat_active:
+            clear_enough = safe_clearance > float(self.RULE_RETREAT_RELEASE_DIST)
+            force_clear = force_norm < float(self.RULE_FORCE_RELEASE_N)
+            danger_clear = danger_score < float(self.RULE_CLEAR_SCORE)
+            if clear_enough and force_clear and danger_clear:
+                self.rule_safety_retreat_active = False
+
+        if self.rule_safety_retreat_active:
+            self.rule_safety_retreat_steps += 1
+        else:
+            self.rule_safety_retreat_steps = 0
+
+        retreat_gain = 0.0
+        filtered_lin_delta = lin_delta
+        mode = "TRACK"
+        if self.rule_safety_retreat_active:
+            retreat_gain = float(
+                np.clip(
+                    max(float(self.RULE_MIN_RETREAT_GAIN), danger_score, float(geometry_danger)),
+                    0.0,
+                    1.0,
+                )
+            )
+            center_vec = lateral_to_center_w * (float(self.RULE_LATERAL_STEP) * center_gain)
+            filtered_lin_delta = retract_dir_w * (float(self.RULE_RETREAT_STEP) * retreat_gain) + center_vec
+            arm_delta[3:] = 0.0
+            mode = "RETREAT"
+        else:
+            if slow_gain > 0.0 and inward_mag > 0.0:
+                filtered_lin_delta = filtered_lin_delta - slow_gain * inward_mag * inward_dir_w
+            if center_gain > 0.0:
+                filtered_lin_delta = filtered_lin_delta + lateral_to_center_w * (float(self.RULE_LATERAL_STEP) * center_gain)
+            if center_gain > 0.05 and slow_gain > 0.05:
+                mode = "SLOW_CENTER"
+            elif center_gain > 0.05:
+                mode = "CENTER"
+            elif slow_gain > 0.05:
+                mode = "SLOW"
+
+        # 规则层叠加后再次限制平移步长，保证不会绕过原有单步笛卡尔安全边界。
+        filtered_norm = float(np.linalg.norm(filtered_lin_delta))
+        if filtered_norm > float(self.args.max_cartesian_step):
+            filtered_lin_delta = filtered_lin_delta * (float(self.args.max_cartesian_step) / max(filtered_norm, 1.0e-6))
+            filtered_norm = float(np.linalg.norm(filtered_lin_delta))
+        arm_delta[:3] = filtered_lin_delta.astype(np.float32)
+
+        safety_state = {
+            "mode": mode,
+            "slow_gain": float(slow_gain),
+            "center_gain": float(center_gain),
+            "retreat_gain": float(retreat_gain),
+            "danger_score": float(danger_score),
+            "lip_risk": float(lip_risk),
+            "link_risk": float(link_risk),
+            "force_risk": float(force_risk),
+            "poke_risk": float(poke_risk),
+            "spoon_mouth_dist": spoon_mouth_dist,
+            "spoon_radial": spoon_radial,
+            "mouth_depth": mouth_depth,
+            "force_norm": force_norm,
+            "torque_norm": torque_norm,
+            "axial_force": axial_force,
+            "signed_axial_force": signed_axial_force,
+            "wrench_sign": float(self.wrench_sign),
+            "safe_clearance": safe_clearance,
+            "retreat_active": bool(self.rule_safety_retreat_active),
+            "retreat_steps": int(self.rule_safety_retreat_steps),
+            "inside_mouth_channel": bool(inside_mouth_channel),
+            "safety_zone": bool(safety_zone),
+            "policy_delta_norm": lin_norm,
+            "final_delta_norm": filtered_norm,
+        }
+        self.rule_safety_last_state = safety_state
+        self.record_safety_gain_curve_sample(safety_state)
+        self.update_safety_gain_visualization(safety_state)
+        return arm_delta, safety_state
+
+    @staticmethod
+    def draw_gain_bar(canvas: np.ndarray, top_left: tuple[int, int], width: int, label: str, value: float, color: tuple[int, int, int]) -> None:
+        """在增益面板上画一条 0~1 的条形图。"""
+        assert cv2 is not None
+        x, y = top_left
+        value = float(np.clip(value, 0.0, 1.0))
+        cv2.putText(canvas, label, (x, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (235, 235, 235), 1, cv2.LINE_AA)
+        bar_x = x + 110
+        cv2.rectangle(canvas, (bar_x, y), (bar_x + width, y + 24), (80, 80, 80), 1)
+        fill_w = int(round(width * value))
+        if fill_w > 0:
+            cv2.rectangle(canvas, (bar_x, y), (bar_x + fill_w, y + 24), color, -1)
+        cv2.putText(canvas, f"{value:.2f}", (bar_x + width + 14, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def record_safety_gain_curve_sample(self, safety_state: dict[str, float | str | bool]) -> None:
+        """记录完整 episode 的三通道安全增益，供结束时生成论文曲线。"""
+        if not self.save_full_safety_gain_curve:
+            return
+        if self.episode_start_time_ns is None:
+            time_s = float(self.policy_step) * self.control_period
+        else:
+            time_s = (self.get_clock().now().nanoseconds - self.episode_start_time_ns) * 1.0e-9
+        self.safety_gain_curve_rows.append(
+            {
+                "step": float(self.policy_step),
+                "time_s": float(time_s),
+                "gslow": float(safety_state["slow_gain"]),
+                "glat": float(safety_state["center_gain"]),
+                "gret": float(safety_state["retreat_gain"]),
+                "danger_score": float(safety_state["danger_score"]),
+                "lip_risk": float(safety_state["lip_risk"]),
+                "link_risk": float(safety_state["link_risk"]),
+                "force_risk": float(safety_state["force_risk"]),
+                "poke_risk": float(safety_state["poke_risk"]),
+                "spoon_mouth_dist": float(safety_state["spoon_mouth_dist"]),
+                "spoon_radial": float(safety_state["spoon_radial"]),
+                "mouth_depth": float(safety_state["mouth_depth"]),
+                "force_norm": float(safety_state["force_norm"]),
+                "axial_force": float(safety_state["axial_force"]),
+                "signed_axial_force": float(safety_state["signed_axial_force"]),
+                "mode": str(safety_state["mode"]),
+                "safety_zone": bool(safety_state["safety_zone"]),
+                "retreat_active": bool(safety_state["retreat_active"]),
+            }
+        )
+
+    def save_safety_gain_curve_outputs(self, reason_label: str = "shutdown") -> None:
+        """保存完整三增益曲线 PNG 和 CSV，便于论文制图和后续复现实机曲线。"""
+        if not self.save_full_safety_gain_curve or self.safety_gain_curve_saved or len(self.safety_gain_curve_rows) == 0:
+            return
+        SAFETY_GAIN_VIS_DIR.mkdir(parents=True, exist_ok=True)
+        label = "".join(ch if ch.isalnum() else "_" for ch in reason_label.lower()).strip("_") or "episode"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_path = SAFETY_GAIN_VIS_DIR / f"safety_gain_curve_{stamp}_{label}"
+        csv_path = base_path.with_suffix(".csv")
+        png_path = base_path.with_suffix(".png")
+        fieldnames = [
+            "step",
+            "time_s",
+            "gslow",
+            "glat",
+            "gret",
+            "danger_score",
+            "lip_risk",
+            "link_risk",
+            "force_risk",
+            "poke_risk",
+            "spoon_mouth_dist",
+            "spoon_radial",
+            "mouth_depth",
+            "force_norm",
+            "axial_force",
+            "signed_axial_force",
+            "mode",
+            "safety_zone",
+            "retreat_active",
+        ]
+        try:
+            with csv_path.open("w", newline="") as file_obj:
+                writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.safety_gain_curve_rows)
+        except OSError as exc:
+            self.get_logger().warn(f"安全增益完整曲线 CSV 保存失败: {exc}")
+
+        plotted = self.plot_safety_gain_curve_matplotlib(png_path)
+        if not plotted:
+            plotted = self.plot_safety_gain_curve_cv2(png_path)
+        if plotted:
+            self.get_logger().info(f"安全增益完整曲线已保存: png={png_path}, csv={csv_path}")
+        else:
+            self.get_logger().warn(f"安全增益完整曲线 PNG 保存失败，但 CSV 仍可用于重画: {csv_path}")
+        self.safety_gain_curve_saved = True
+
+    @staticmethod
+    def _rows_to_gain_array(rows: list[dict[str, float | str | bool]]) -> np.ndarray:
+        """把三条安全增益整理成 N x 3 数组，便于分段和异常点检测。"""
+        if len(rows) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        return np.asarray(
+            [
+                [float(row["gslow"]), float(row["glat"]), float(row["gret"])]
+                for row in rows
+            ],
+            dtype=np.float32,
+        )
+
+    def build_safety_gain_curve_plot_rows(self) -> list[dict[str, float | str | bool]]:
+        """剔除一个明显的孤立跳点后再绘图，避免曲线首段出现不自然的折点。"""
+        rows = list(self.safety_gain_curve_rows)
+        outlier_idx = self.find_safety_gain_curve_outlier_index(rows)
+        if outlier_idx is None:
+            return rows
+        return rows[:outlier_idx] + rows[outlier_idx + 1 :]
+
+    def find_safety_gain_curve_outlier_index(self, rows: list[dict[str, float | str | bool]] | None = None) -> int | None:
+        """找出一个最像“孤立异常点”的样本索引，只用于画图，不改 CSV 原始记录。"""
+        plot_rows = self.safety_gain_curve_rows if rows is None else rows
+        row_count = len(plot_rows)
+        if row_count < 3:
+            return None
+
+        gains = self._rows_to_gain_array(plot_rows)
+        best_idx = -1
+        best_score = 0.0
+        for idx in range(1, row_count - 1):
+            local_score = 0.0
+            for col in range(gains.shape[1]):
+                neighborhood = gains[idx - 1 : idx + 2, col]
+                local_median = float(np.median(neighborhood))
+                local_score += abs(float(gains[idx, col]) - local_median)
+            if local_score > best_score:
+                best_score = local_score
+                best_idx = idx
+
+        # 只把足够明显的单点跳变当成异常点，避免误删真实峰值。
+        if best_score < 0.15:
+            return None
+        return best_idx
+
+    def build_safety_gain_curve_stage_axis(self, rows: list[dict[str, float | str | bool]] | None = None) -> np.ndarray:
+        """把完整曲线样本压缩到 approach / feeding / retreat 三段横轴上。"""
+        plot_rows = self.safety_gain_curve_rows if rows is None else rows
+        row_count = len(plot_rows)
+        if row_count == 0:
+            return np.zeros(0, dtype=np.float32)
+        if row_count < 3:
+            return np.linspace(0.5, 2.5, row_count, dtype=np.float32)
+
+        approach_end = next(
+            (idx for idx, row in enumerate(plot_rows) if float(row.get("mouth_depth", 0.0)) > 0.0),
+            max(1, row_count // 3),
+        )
+        approach_end = min(max(int(approach_end), 1), row_count - 1)
+
+        gains = self._rows_to_gain_array(plot_rows)
+        peak_idx = int(np.argmax(np.max(gains, axis=1)))
+        feeding_end = min(row_count, max(peak_idx + 1, approach_end + 1))
+
+        stage_sizes = (
+            max(approach_end, 1),
+            max(feeding_end - approach_end, 1),
+            max(row_count - feeding_end, 1),
+        )
+        stage_x = np.empty(row_count, dtype=np.float32)
+        for idx in range(row_count):
+            if idx < approach_end:
+                stage_idx = 0
+                stage_pos = idx
+                stage_size = stage_sizes[0]
+            elif idx < feeding_end:
+                stage_idx = 1
+                stage_pos = idx - approach_end
+                stage_size = stage_sizes[1]
+            else:
+                stage_idx = 2
+                stage_pos = idx - feeding_end
+                stage_size = stage_sizes[2]
+            stage_x[idx] = stage_idx + (float(stage_pos) + 0.5) / float(stage_size)
+        return stage_x
+
+    def plot_safety_gain_curve_matplotlib(self, png_path: Path) -> bool:
+        """优先用 matplotlib 输出论文可用的高分辨率三增益曲线。"""
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            self.get_logger().warn(f"matplotlib 不可用，将尝试 OpenCV 兜底绘制安全增益曲线: {exc}")
+            return False
+
+        try:
+            plot_rows = self.build_safety_gain_curve_plot_rows()
+            stage_x = self.build_safety_gain_curve_stage_axis(plot_rows)
+            fig, axis = plt.subplots(figsize=(9.0, 4.8))
+            axis.plot(stage_x, [float(row["gslow"]) for row in plot_rows], color="#1f77b4", linewidth=2.1)
+            axis.plot(stage_x, [float(row["glat"]) for row in plot_rows], color="#2ca02c", linewidth=2.1)
+            axis.plot(stage_x, [float(row["gret"]) for row in plot_rows], color="#d62728", linewidth=2.1)
+            for boundary in (1.0, 2.0):
+                axis.axvline(boundary, color="#b0b0b0", linestyle="--", linewidth=1.0, alpha=0.45)
+            axis.set_xlim(0.0, 3.0)
+            axis.set_xticks([0.5, 1.5, 2.5], ["approach", "feeding", "retreat"])
+            axis.set_xlabel("Stage")
+            axis.set_ylabel("Gain")
+            axis.set_ylim(-0.03, 1.05)
+            axis.grid(True, alpha=0.25)
+            axis.set_title("Safety Gain Profiles by Stage")
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=max(80, int(self.SAFETY_GAIN_CURVE_DPI)))
+            plt.close(fig)
+            return True
+        except Exception as exc:
+            self.get_logger().warn(f"matplotlib 绘制安全增益完整曲线失败: {exc}")
+            return False
+
+    def plot_safety_gain_curve_cv2(self, png_path: Path) -> bool:
+        """OpenCV 兜底保存三增益曲线，避免缺少 matplotlib 时完全没有图片。"""
+        if cv2 is None:
+            return False
+        try:
+            canvas = np.full((700, 1200, 3), 255, dtype=np.uint8)
+            plot_x, plot_y, plot_w, plot_h = 90, 90, 1040, 500
+            cv2.rectangle(canvas, (plot_x, plot_y), (plot_x + plot_w, plot_y + plot_h), (35, 35, 35), 2)
+            cv2.putText(canvas, "Safety Gain Profiles by Stage", (90, 52), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (25, 25, 25), 2, cv2.LINE_AA)
+            cv2.putText(canvas, "Stage", (560, 665), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (25, 25, 25), 2, cv2.LINE_AA)
+            cv2.putText(canvas, "Gain", (18, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (25, 25, 25), 2, cv2.LINE_AA)
+            for frac in (0.25, 0.5, 0.75):
+                yy = plot_y + int(round(plot_h * (1.0 - frac)))
+                cv2.line(canvas, (plot_x, yy), (plot_x + plot_w, yy), (220, 220, 220), 1)
+                cv2.putText(canvas, f"{frac:.2f}", (38, yy + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (70, 70, 70), 1, cv2.LINE_AA)
+            plot_rows = self.build_safety_gain_curve_plot_rows()
+            stage_x = self.build_safety_gain_curve_stage_axis(plot_rows)
+            for boundary_frac in (1.0 / 3.0, 2.0 / 3.0):
+                xx = plot_x + int(round(plot_w * boundary_frac))
+                cv2.line(canvas, (xx, plot_y), (xx, plot_y + plot_h), (205, 205, 205), 1, cv2.LINE_AA)
+            for idx, stage_name in enumerate(("approach", "feeding", "retreat")):
+                center_x = plot_x + int(round(plot_w * ((idx + 0.5) / 3.0)))
+                text_size = cv2.getTextSize(stage_name, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 1)[0]
+                cv2.putText(
+                    canvas,
+                    stage_name,
+                    (center_x - text_size[0] // 2, 658),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.56,
+                    (60, 60, 60),
+                    1,
+                    cv2.LINE_AA,
+                )
+            for key, color in (
+                ("gslow", (180, 119, 31)),
+                ("glat", (44, 160, 44)),
+                ("gret", (40, 39, 214)),
+            ):
+                values = np.asarray([float(row[key]) for row in plot_rows], dtype=np.float32)
+                if values.size < 2:
+                    continue
+                xs = plot_x + np.clip(stage_x / 3.0, 0.0, 1.0) * plot_w
+                ys = plot_y + plot_h - 1 - np.clip(values, 0.0, 1.0) * (plot_h - 2)
+                pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(canvas, [pts], False, color, 3, cv2.LINE_AA)
+            return bool(cv2.imwrite(str(png_path), canvas))
+        except Exception as exc:
+            self.get_logger().warn(f"OpenCV 绘制安全增益完整曲线失败: {exc}")
+            return False
+
+    def update_safety_gain_visualization(self, safety_state: dict[str, float | str | bool]) -> None:
+        """把安全层三个增益画成实时条形图和曲线，体现 safety filter 的作用。"""
+        self.safety_gain_history["slow"].append(float(safety_state["slow_gain"]))
+        self.safety_gain_history["center"].append(float(safety_state["center_gain"]))
+        self.safety_gain_history["retreat"].append(float(safety_state["retreat_gain"]))
+        if not self.safety_gain_visualization_enabled and not self.save_safety_gain_images:
+            return
+        if cv2 is None:
+            return
+
+        try:
+            canvas = np.full((460, 760, 3), 18, dtype=np.uint8)
+            cv2.putText(canvas, "Safety Gains: gslow / glat / gret", (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                canvas,
+                f"mode={safety_state['mode']}  zone={'ON' if safety_state['safety_zone'] else 'OFF'}  "
+                f"retreat={'ON' if safety_state['retreat_active'] else 'OFF'}  steps={safety_state['retreat_steps']}",
+                (24, 66),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.56,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
+            self.draw_gain_bar(canvas, (24, 108), 440, "gslow", float(safety_state["slow_gain"]), (0, 215, 255))
+            self.draw_gain_bar(canvas, (24, 145), 440, "glat", float(safety_state["center_gain"]), (80, 220, 120))
+            self.draw_gain_bar(canvas, (24, 182), 440, "gret", float(safety_state["retreat_gain"]), (70, 90, 255))
+            cv2.putText(
+                canvas,
+                f"dist={safety_state['spoon_mouth_dist']*1000.0:.1f}mm  radial={safety_state['spoon_radial']*1000.0:.1f}mm  "
+                f"depth={safety_state['mouth_depth']*1000.0:.1f}mm  channel={'YES' if safety_state['inside_mouth_channel'] else 'NO'}",
+                (24, 244),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.54,
+                (235, 235, 235),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                f"danger={safety_state['danger_score']:.2f}  lip={safety_state['lip_risk']:.2f}  link={safety_state['link_risk']:.2f}  "
+                f"force={safety_state['force_norm']:.1f}N  axial={safety_state['axial_force']:.1f}N  "
+                f"signed={safety_state['signed_axial_force']:.1f}N  sign={safety_state['wrench_sign']:+.0f}",
+                (24, 272),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (235, 235, 235),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                f"policy_delta={safety_state['policy_delta_norm']*1000.0:.1f}mm  final_delta={safety_state['final_delta_norm']*1000.0:.1f}mm  "
+                f"clearance={safety_state['safe_clearance']*1000.0:.1f}mm",
+                (24, 300),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.54,
+                (235, 235, 235),
+                1,
+                cv2.LINE_AA,
+            )
+
+            plot_x, plot_y, plot_w, plot_h = 24, 340, 700, 92
+            cv2.rectangle(canvas, (plot_x, plot_y), (plot_x + plot_w, plot_y + plot_h), (75, 75, 75), 1)
+            for frac in (0.25, 0.5, 0.75):
+                yy = plot_y + int(round(plot_h * (1.0 - frac)))
+                cv2.line(canvas, (plot_x, yy), (plot_x + plot_w, yy), (42, 42, 42), 1)
+            for key, color in (("slow", (0, 215, 255)), ("center", (80, 220, 120)), ("retreat", (70, 90, 255))):
+                history = np.asarray(self.safety_gain_history[key], dtype=np.float32)
+                if history.size < 2:
+                    continue
+                xs = np.linspace(plot_x, plot_x + plot_w, history.size, dtype=np.float32)
+                ys = plot_y + plot_h - 1 - history * (plot_h - 2)
+                pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(canvas, [pts], False, color, 2, cv2.LINE_AA)
+
+            if self.safety_gain_visualization_enabled:
+                try:
+                    cv2.imshow(self.safety_gain_window, canvas)
+                    cv2.waitKey(1)
+                except Exception as exc:
+                    self.safety_gain_visualization_enabled = False
+                    self.get_logger().warn(f"安全增益窗口显示失败，已关闭窗口显示: {exc}", throttle_duration_sec=2.0)
+            if self.save_safety_gain_images and self.policy_step % self.safety_gain_image_interval == 0:
+                cv2.imwrite(str(SAFETY_GAIN_VIS_DIR / "latest_safety_gains.png"), canvas)
+        except Exception as exc:
+            self.safety_gain_visualization_enabled = False
+            self.get_logger().warn(f"安全增益图像可视化失败，已关闭窗口显示: {exc}", throttle_duration_sec=2.0)
+
+    def close_safety_gain_visualization(self) -> None:
+        """关闭安全增益窗口，避免 Ctrl-C 后 OpenCV 窗口残留。"""
+        if cv2 is None:
+            return
+        try:
+            cv2.destroyWindow(self.safety_gain_window)
+        except Exception:
+            pass
 
     def step_callback(self) -> None:
         if not self.target_received:
@@ -501,10 +1653,33 @@ class ArmPolicyDeployNode(Node):
         arm_delta[:3] *= self.args.action_scale_arm
         arm_delta[3:] *= self.ARM_ACTION_ROTATION_SCALE
         arm_delta *= startup_action_scale
+        policy_arm_delta = arm_delta.copy()
+        if self.learned_safety_enabled:
+            arm_delta, safety_state = self.apply_learned_safety_filter(
+                ee_pos,
+                ee_quat_wxyz,
+                spoon_center,
+                arm_delta,
+            )
+        else:
+            arm_delta, safety_state = self.apply_rule_based_safety_filter(
+                ee_pos,
+                ee_quat_wxyz,
+                spoon_center,
+                arm_delta,
+            )
         arm_delta_ik = self.ros_delta_to_ik_delta(arm_delta)
         mouth_axis_raw = self.compute_mouth_axis(invert=False)
         mouth_axis = self.compute_mouth_axis()
-        self.record_wrench_sample(spoon_center, raw_action, policy_action, command_action, arm_delta)
+        self.record_wrench_sample(
+            spoon_center,
+            raw_action,
+            policy_action,
+            command_action,
+            arm_delta,
+            safety_state,
+            policy_arm_delta,
+        )
 
         if self.args.debug_obs:
             self.log_observation_debug(
@@ -518,6 +1693,7 @@ class ArmPolicyDeployNode(Node):
                 mouth_axis_raw,
                 mouth_axis,
                 spoon_center,
+                safety_state,
             )
 
         delta_safe, delta_safety_msg = self.delta_safety_status(ee_pos, ee_quat_wxyz, arm_delta)
@@ -542,6 +1718,9 @@ class ArmPolicyDeployNode(Node):
             self.get_logger().info(
                 f"dry-run policy_action={np.round(policy_action, 3)}, "
                 f"command_action={np.round(command_action, 3)}, "
+                f"safety_gain=[slow={safety_state['slow_gain']:.2f}, "
+                f"center={safety_state['center_gain']:.2f}, "
+                f"retreat={safety_state['retreat_gain']:.2f}], "
                 f"joint_target(deg)={np.round(np.rad2deg(joint_target), 1)}",
                 throttle_duration_sec=0.5,
             )
@@ -600,6 +1779,10 @@ class ArmPolicyDeployNode(Node):
             if not self.args.dry_run:
                 self.publish_joint_target(self.success_hold_joint_pos)
         self.previous_arm_action = np.zeros(6, dtype=np.float32)
+        self.previous_safety_action.fill(0.0)
+        self.safety_slow_active = False
+        self.rule_safety_retreat_active = False
+        self.rule_safety_retreat_steps = 0
         self.get_logger().warn(
             "成功条件已连续稳定满足，进入成功后保持阶段: "
             f"hold_steps={self.SUCCESS_HOLD_STEPS_AFTER_REACHED}"
@@ -636,6 +1819,7 @@ class ArmPolicyDeployNode(Node):
         bowl_tilt = math.acos(float(np.clip(spoon_up[2], -1.0, 1.0)))
         align_dot = float(np.dot(spoon_axis, mouth_axis))
         radial_ok = radial < self.FEED_INSERT_RADIUS_M
+        # depth_ok 这里的正负号是关键: mouth_depth > 0 才代表勺心已经进入嘴内。
         depth_ok = self.FEED_INSERT_DEPTH_MIN_M < mouth_depth < self.FEED_INSERT_DEPTH_MAX_M
         align_ok = align_dot > self.FEED_INSERT_ALIGN_DOT_MIN
         feed_reached = bool(radial_ok and depth_ok and align_ok)
@@ -659,6 +1843,10 @@ class ArmPolicyDeployNode(Node):
             return
         self.episode_stopped = True
         self.previous_arm_action = np.zeros(6, dtype=np.float32)
+        self.previous_safety_action.fill(0.0)
+        self.safety_slow_active = False
+        self.rule_safety_retreat_active = False
+        self.rule_safety_retreat_steps = 0
         metrics = self.last_fsm_metrics
         mouth_delta = self.mouth_pos - spoon_center if self.mouth_pos is not None else None
         metrics_msg = ""
@@ -675,6 +1863,7 @@ class ArmPolicyDeployNode(Node):
             f"[episode {reason_type}] {reason}; state={self.fsm_state}, steps={self.policy_step}, "
             f"mouth-spoon={np.round(mouth_delta, 4) if mouth_delta is not None else 'n/a'}{metrics_msg}"
         )
+        self.save_safety_gain_curve_outputs(reason_type)
         if not self.args.dry_run and self.current_joint_pos is not None:
             self.publish_joint_target(self.current_joint_pos)
         if reason_type == "SUCCESS":
@@ -742,9 +1931,15 @@ class ArmPolicyDeployNode(Node):
     def align_wrist_wrench_direction(self, wrench_source: np.ndarray) -> np.ndarray:
         """在同一tool0_controller/wrist_3_link坐标系内同步真实力和仿真力的方向约定。"""
         wrench_source = np.nan_to_num(np.asarray(wrench_source, dtype=np.float32), nan=0.0, posinf=250.0, neginf=-250.0)
-        # 真实传感器与仿真关节反力可能是作用/反作用关系；用--wrench-sign做最小必要的方向同步。
+        # 真实传感器与仿真关节反力可能是作用/反作用关系；用 wrench_sign 做最小必要的方向同步。
         policy_raw = self.wrench_sign * wrench_source.astype(np.float32)
         return np.nan_to_num(policy_raw, nan=0.0, posinf=250.0, neginf=-250.0)
+
+    def get_sim_aligned_safety_wrench_raw(self) -> np.ndarray:
+        """读取 safety 专用 wrench，显式使用与仿真/策略一致的方向约定。"""
+        # 这里重新从 sensor-bias 计算一次，而不是直接读名字较泛的缓存，确保 safety 的力方向始终跟随 wrench_sign。
+        sensor_minus_bias = self.wrist_wrench_sensor_raw - self.wrist_wrench_sensor_bias
+        return self.align_wrist_wrench_direction(sensor_minus_bias)
 
     @staticmethod
     def clip_vector_norm(vector: np.ndarray, limit: float) -> np.ndarray:
@@ -819,9 +2014,12 @@ class ArmPolicyDeployNode(Node):
         mouth_axis_raw: np.ndarray,
         mouth_axis: np.ndarray,
         spoon_center: np.ndarray,
+        safety_state: dict[str, object] | None = None,
     ) -> None:
         assert self.mouth_pos is not None
         assert self.mouth_quat_wxyz is not None
+        if safety_state is None:
+            safety_state = self.default_rule_safety_state()
         mouth_feature_points = obs[25:43].reshape(6, 3)
         point_lines = "\n".join(
             f"    p{point_idx}: {self.format_debug_array(point)}"
@@ -855,6 +2053,15 @@ class ArmPolicyDeployNode(Node):
             f"  startup_action_scale = {startup_action_scale:.5f}\n"
             f"  arm_delta_ros = {self.format_debug_array(arm_delta)}\n"
             f"  arm_delta_ik = {self.format_debug_array(arm_delta_ik)}\n"
+            f"  safety = mode:{safety_state['mode']}, "
+            f"slow:{safety_state['slow_gain']:.3f}, "
+            f"center:{safety_state['center_gain']:.3f}, "
+            f"retreat:{safety_state['retreat_gain']:.3f}, "
+            f"danger:{safety_state['danger_score']:.3f}, "
+            f"radial:{safety_state['spoon_radial']:.4f}, "
+            f"depth:{safety_state['mouth_depth']:.4f}, "
+            f"signed_axial_force:{safety_state['signed_axial_force']:.3f}, "
+            f"wrench_sign:{safety_state['wrench_sign']:+.0f}\n"
             f"  fsm_state = {self.fsm_state}\n"
             f"  fsm_metrics = {self.format_fsm_metrics()}",
             throttle_duration_sec=0.5,
@@ -1082,7 +2289,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--target-frame", default="base_link", help="Robot base frame used by the policy observation.")
     parser.add_argument("--ee-frame", default="wrist_3_link", help="End-effector frame matching the IsaacLab ee_link_name.")
     parser.add_argument("--wrench-source-frame", default="tool0_controller", help="Fallback frame for the UR F/T wrench if the message header is empty.")
-    parser.add_argument("--wrench-sign", type=float, default=-1.0, choices=[-1.0, 1.0], help="Sign used to align real F/T direction with the simulation joint-reaction convention.")
+    parser.add_argument("--wrench-sign", type=float, default=ArmPolicyDeployNode.WRENCH_SIM_REAL_SIGN, choices=[-1.0, 1.0], help="Sign used to align real F/T direction with the simulation joint-reaction convention.")
     parser.add_argument("--wrench-bias-samples", type=int, default=30, help="Stationary wrench samples used for tare after sign/frame alignment; 0 disables tare.")
     parser.add_argument("--control-hz", type=float, default=30.0, help="Policy/control frequency, matching sim decimation.")
     parser.add_argument("--target-timeout", type=float, default=0.5, help="Stop commanding if the mouth pose topic is older than this many seconds.")
@@ -1130,6 +2337,8 @@ def main() -> None:
         pass
     finally:
         node.close_wrench_record()
+        node.save_safety_gain_curve_outputs("shutdown")
+        node.close_safety_gain_visualization()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
