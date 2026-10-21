@@ -35,6 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from python.controllers.harl_arm_policy import HarlArmPolicy
+from python.utils.joint_angle_recorder import JointAngleRecorder
 from python.utils.ur5e_kinematics import UR5eDLSIK, quat_apply_wxyz, quat_xyzw_to_wxyz
 
 
@@ -42,6 +43,7 @@ DEFAULT_MODEL_PATH = PROJECT_ROOT / "sample/actor_agent_arm_torchscript.pt"
 DEFAULT_SAFETY_MODEL_PATH = PROJECT_ROOT / "sample/actor_agent_safety_torchscript.pt"
 WRENCH_RECORD_DIR = PROJECT_ROOT / "logs" / "wrench_records"
 SAFETY_GAIN_VIS_DIR = PROJECT_ROOT / "logs" / "safety_gain_visualization"
+JOINT_ANGLE_RECORD_DIR = PROJECT_ROOT / "logs" / "joint_angle_records"
 
 
 class ArmPolicyDeployNode(Node):
@@ -150,7 +152,7 @@ class ArmPolicyDeployNode(Node):
     RULE_MOUTH_CHANNEL_BACK = 0.030
 
     # 风险阈值: 控制嘴唇/嘴部连杆/腕部力觉何时触发减速或撤回。
-    RULE_LIP_MARGIN = 0.025
+    RULE_LIP_MARGIN = 0.040
     RULE_LINK_THRESHOLD = 0.018
     RULE_FORCE_THRESHOLD_N = 8.0
     RULE_FORCE_RELEASE_N = 5.0
@@ -300,6 +302,21 @@ class ArmPolicyDeployNode(Node):
             self.target_received = True
             self.last_face_time_ns = self.get_clock().now().nanoseconds
 
+        self.joint_angle_recorder: JointAngleRecorder | None = None
+        try:
+            self.joint_angle_recorder = JointAngleRecorder(
+                JOINT_ANGLE_RECORD_DIR,
+                self.JOINT_NAMES,
+                sample_period_s=self.control_period,
+                mode="dry_run" if args.dry_run else "motion",
+            )
+            self.get_logger().info(
+                f"六关节实际角度自动记录: csv={self.joint_angle_recorder.csv_path}；"
+                "任务结束或 Ctrl-C 时保存曲线图，纵轴范围 [-2π, 2π] rad。"
+            )
+        except OSError as exc:
+            self.get_logger().warn(f"无法创建关节角记录文件: {exc}")
+
         self.create_subscription(JointTrajectoryControllerState, self.STATE_TOPIC, self.joint_state_callback, 10)
         if not args.fixed_mouth_pose:
             self.create_subscription(PoseStamped, self.mouth_topic, self.face_pose_callback, 10)
@@ -397,6 +414,27 @@ class ArmPolicyDeployNode(Node):
         self.current_joint_pos = pos
         self.current_joint_vel = vel
         self.last_joint_state_time_ns = self.get_clock().now().nanoseconds
+        if self.joint_angle_recorder is not None:
+            try:
+                self.joint_angle_recorder.record(msg.joint_names, msg.feedback.positions)
+            except OSError as exc:
+                self.get_logger().warn(f"关节角 CSV 写入失败: {exc}", throttle_duration_sec=2.0)
+
+    def save_joint_angle_curve(self, close_record: bool = False) -> None:
+        recorder = self.joint_angle_recorder
+        if recorder is None:
+            return
+        try:
+            png_path = recorder.close() if close_record else recorder.save_plot()
+            if png_path is not None:
+                self.get_logger().info(
+                    f"六关节角度曲线已保存: png={png_path}, csv={recorder.csv_path}, "
+                    f"samples={recorder.sample_count}"
+                )
+            elif close_record:
+                self.get_logger().warn(f"未收到完整有效的六关节反馈，关节角 CSV 只有表头: {recorder.csv_path}")
+        except Exception as exc:
+            self.get_logger().warn(f"关节角曲线保存失败: {exc}；已记录的数据见 {recorder.csv_path}")
 
     def speed_scaling_callback(self, msg: Float64) -> None:
         self.speed_scaling = float(msg.data)
@@ -1864,6 +1902,7 @@ class ArmPolicyDeployNode(Node):
             f"mouth-spoon={np.round(mouth_delta, 4) if mouth_delta is not None else 'n/a'}{metrics_msg}"
         )
         self.save_safety_gain_curve_outputs(reason_type)
+        self.save_joint_angle_curve()
         if not self.args.dry_run and self.current_joint_pos is not None:
             self.publish_joint_target(self.current_joint_pos)
         if reason_type == "SUCCESS":
@@ -2336,6 +2375,7 @@ def main() -> None:
         # 允许 Ctrl-C 或外部 shutdown 安静退出，避免实机调试时刷出无意义 traceback。
         pass
     finally:
+        node.save_joint_angle_curve(close_record=True)
         node.close_wrench_record()
         node.save_safety_gain_curve_outputs("shutdown")
         node.close_safety_gain_visualization()

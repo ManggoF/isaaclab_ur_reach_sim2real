@@ -115,6 +115,16 @@ Follow these steps to run the simulation:
 
 This section is a work in progress (WIP).
 
+Running `python3 deploy/run_task.py` automatically records the six measured joint
+angles to `logs/joint_angle_records/joint_angles_<timestamp>_<mode>.csv`. Columns
+contain elapsed time in seconds and each joint angle in radians. Feedback is
+sampled at most at `--control-hz` (30 Hz by default), including pauses and automatic
+reset motion while the node is running. At episode end and on Ctrl+C, a matching
+PNG overlays all six curves on one axis with a legend; the vertical axis spans
+`-2π` to `2π` radians.
+The CSV retains the original angles without clipping or wrapping. This also works
+with `--dry-run`.
+
 ### Tool Mass and Center-of-Mass Calibration
 
 Use `deploy/measure_tool_com.py` to identify the combined gripper-and-spoon payload from static multi-pose force/torque measurements. The procedure, safety constraints, output fields, and simulation update method are documented in [TOOL_COM_CALIBRATION.md](TOOL_COM_CALIBRATION.md).
