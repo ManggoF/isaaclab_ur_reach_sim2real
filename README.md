@@ -115,11 +115,30 @@ Follow these steps to run the simulation:
 
 This section is a work in progress (WIP).
 
+After stable insertion succeeds, deployment holds for 30 control steps, then
+withdraws 10 cm along the reverse of the latched mouth entry axis while maintaining
+the end-effector orientation. The complete withdrawal is planned and published
+once as one continuous trajectory, with smooth start/stop and continuous velocities
+through its internal path samples. There is no feedback wait or pause between
+samples. Its nominal average speed is 5 cm/s (2 seconds for 10 cm), subject to joint
+velocity limits and UR speed scaling. Automatic joint reset starts only after
+feedback confirms the withdrawal target (2 mm position tolerance) and a stable
+stop outside the mouth. The same deployment node immediately publishes the reset
+trajectory using its existing connection, without starting another process or
+rendering plots first. Reset uses a nominal joint speed of at most 0.25 rad/s and
+a minimum duration of 4 seconds. Plots are saved after reset completes or times out,
+so joint feedback continues to be recorded throughout reset.
+Withdrawal timeout, invalid feedback, or path/workspace
+violations stop the episode without automatic reset. `--withdraw-distance` changes
+the withdrawal distance in meters (default `0.10`, minimum `0.08`). In `--dry-run`,
+the withdrawal goal is logged without publishing withdrawal or reset motion.
+
 Running `python3 deploy/run_task.py` automatically records the six measured joint
 angles to `logs/joint_angle_records/joint_angles_<timestamp>_<mode>.csv`. Columns
 contain elapsed time in seconds and each joint angle in radians. Feedback is
 sampled at most at `--control-hz` (30 Hz by default), including pauses and automatic
-reset motion while the node is running. At episode end and on Ctrl+C, a matching
+reset motion while the node is running. At episode end (after automatic reset, if
+enabled) and on Ctrl+C, a matching
 PNG overlays all six curves on one axis with a legend; the vertical axis spans
 `-2π` to `2π` radians.
 The CSV retains the original angles without clipping or wrapping. This also works

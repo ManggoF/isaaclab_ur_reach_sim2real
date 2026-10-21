@@ -4,7 +4,6 @@ from collections import deque
 from datetime import datetime
 import math
 from pathlib import Path
-import subprocess
 import sys
 
 import numpy as np
@@ -105,7 +104,20 @@ class ArmPolicyDeployNode(Node):
     FEED_INSERT_ALIGN_DOT_MIN = 0.8
     FEED_STABLE_STEPS_REQUIRED = 5
     SUCCESS_HOLD_STEPS_AFTER_REACHED = 30
+    SUCCESS_WITHDRAW_SPEED_M_S = 0.05  # 平均撤回速度：0.10 m / 0.05 m/s = 2 s；仍受关节限速约束。
+    SUCCESS_WITHDRAW_PATH_RESOLUTION_M = 0.0025
+    SUCCESS_WITHDRAW_TIMEOUT_S = 30.0
+    SUCCESS_WITHDRAW_POSITION_TOL_M = 0.002
+    SUCCESS_WITHDRAW_ORIENTATION_TOL_RAD = math.radians(2.0)
+    SUCCESS_WITHDRAW_STABLE_STEPS = 5
+    SUCCESS_WITHDRAW_MAX_LATERAL_ERROR_M = 0.010
+    SUCCESS_WITHDRAW_MAX_ORIENTATION_ERROR_RAD = math.radians(5.0)
     RESET_AFTER_SUCCESS = True
+    RESET_MAX_JOINT_VELOCITY_RAD_S = 0.25
+    RESET_MIN_DURATION_S = 4.0
+    RESET_GOAL_TOL_RAD = math.radians(0.1)
+    RESET_SETTLE_TIME_S = 0.5
+    RESET_TIMEOUT_MARGIN_S = 8.0
     LATCH_FIRST_VISION_MOUTH_POSE = True
     ARM_ACTION_ROTATION_SCALE = 0.002  # 与仿真一致: 旋转增量小于平移增量，避免真机将策略姿态动作放大四倍。
     RESET_ACTION_FREEZE_STEPS = 10  # 与仿真一致: reset 后先冻结10个控制步，避免初始饱和动作立刻改变勺子姿态。
@@ -241,10 +253,21 @@ class ArmPolicyDeployNode(Node):
         self.episode_start_time_ns: int | None = None
         self.episode_stopped = False
         self.reset_started = False
+        self.reset_finished = False
+        self.reset_start_time_ns: int | None = None
+        self.reset_reached_since_ns: int | None = None
+        self.reset_timeout_s = 0.0
         self.fsm_state = "APPROACH"
         self.feed_stable_steps = 0
         self.success_hold_steps = 0
         self.success_hold_joint_pos: np.ndarray | None = None
+        self.success_withdraw_start_spoon: np.ndarray | None = None
+        self.success_withdraw_direction: np.ndarray | None = None
+        self.success_withdraw_quat_wxyz: np.ndarray | None = None
+        self.success_withdraw_start_time_ns: int | None = None
+        self.success_withdraw_stable_steps = 0
+        self.success_withdraw_complete = False
+        self.success_withdraw_trajectory_sent = False
         self.last_fsm_metrics: dict[str, float | bool] = {}
         self.max_episode_steps = (
             args.max_episode_steps
@@ -1639,6 +1662,9 @@ class ArmPolicyDeployNode(Node):
             pass
 
     def step_callback(self) -> None:
+        if self.reset_started and not self.reset_finished:
+            self.update_reset_after_success()
+            return
         if not self.target_received:
             self.get_logger().warn(
                 f"等待视觉嘴部目标 {self.mouth_topic}，尚未开始策略推理。",
@@ -1652,6 +1678,9 @@ class ArmPolicyDeployNode(Node):
             )
             return
         if self.episode_stopped:
+            return
+        if self.fsm_state == "SUCCESS_WITHDRAW":
+            self.update_success_withdraw()
             return
         if self.data_is_stale():
             return
@@ -1779,7 +1808,7 @@ class ArmPolicyDeployNode(Node):
         self.last_fsm_metrics = metrics
 
         if self.fsm_state == "SUCCESS_HOLD":
-            self.update_success_hold(spoon_center)
+            self.update_success_hold(spoon_center, ee_quat_wxyz)
             return True
 
         if metrics["spoon_z"] < self.args.min_spoon_z:
@@ -1826,18 +1855,261 @@ class ArmPolicyDeployNode(Node):
             f"hold_steps={self.SUCCESS_HOLD_STEPS_AFTER_REACHED}"
         )
 
-    def update_success_hold(self, spoon_center: np.ndarray) -> None:
+    def update_success_hold(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> None:
         self.success_hold_steps += 1
         if self.success_hold_joint_pos is not None and not self.args.dry_run:
             self.publish_joint_target(self.success_hold_joint_pos)
         if self.success_hold_steps >= self.SUCCESS_HOLD_STEPS_AFTER_REACHED:
+            self.start_success_withdraw(spoon_center, ee_quat_wxyz)
+
+    def start_success_withdraw(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> None:
+        """锁定成功时的进入轴和姿态，在归位前先把勺子沿原轴直线撤出。"""
+        if not (
+            np.all(np.isfinite(spoon_center))
+            and np.all(np.isfinite(ee_quat_wxyz))
+            and float(np.linalg.norm(ee_quat_wxyz)) > 1.0e-6
+        ):
+            self.stop_episode("FAILURE", "成功后撤回起始位姿无效，取消自动归位。", spoon_center)
+            return
+        direction = -np.asarray(self.compute_mouth_axis(), dtype=np.float64)
+        direction_norm = float(np.linalg.norm(direction))
+        if not np.isfinite(direction_norm) or direction_norm < 1.0e-6:
+            self.stop_episode("FAILURE", "成功后撤回失败: 嘴巴轴向无效，取消自动归位。", spoon_center)
+            return
+        self.success_withdraw_start_spoon = np.asarray(spoon_center, dtype=np.float64).copy()
+        self.success_withdraw_direction = direction / direction_norm
+        self.success_withdraw_quat_wxyz = np.asarray(ee_quat_wxyz, dtype=np.float64).copy()
+        self.success_withdraw_start_time_ns = self.get_clock().now().nanoseconds
+        self.success_withdraw_stable_steps = 0
+        self.success_withdraw_complete = False
+        self.success_withdraw_trajectory_sent = False
+        self.fsm_state = "SUCCESS_WITHDRAW"
+
+        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.args.withdraw_distance
+        goal_ee = goal_spoon - quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
+        if not (
+            np.all(np.isfinite(goal_ee))
+            and np.all(goal_ee >= self.WORKSPACE_MIN)
+            and np.all(goal_ee <= self.WORKSPACE_MAX)
+            and np.all(goal_spoon >= self.WORKSPACE_MIN)
+            and np.all(goal_spoon <= self.WORKSPACE_MAX)
+        ):
+            self.stop_episode("FAILURE", "成功后撤回目标超出工作空间，取消自动归位。", spoon_center)
+            return
+        self.get_logger().warn(
+            "成功后先直线撤回再归位: "
+            f"distance={self.args.withdraw_distance:.3f}m, speed={self.SUCCESS_WITHDRAW_SPEED_M_S:.3f}m/s, "
+            f"direction={np.round(self.success_withdraw_direction, 4)}, goal_spoon={np.round(goal_spoon, 4)}；"
+            "一次下发完整连续轨迹，保持末端姿态，等待实际反馈到位。"
+        )
+        if self.args.dry_run:
             self.fsm_state = "DONE"
-            # 实机暂时没有球位置观测，因此用“勺心稳定入嘴”作为仿真球+勺成功条件的代理。
             self.stop_episode(
                 "SUCCESS",
-                f"勺心入嘴成功后额外保持 {self.SUCCESS_HOLD_STEPS_AFTER_REACHED} 步，开始归位。",
+                "dry-run: 已预览成功后撤回目标，不发布撤回或归位轨迹。",
                 spoon_center,
             )
+
+    def update_success_withdraw(self) -> None:
+        """反馈闭环撤回；完成前不运行策略，也不启动关节归位。"""
+        assert self.success_withdraw_start_spoon is not None
+        assert self.success_withdraw_direction is not None
+        assert self.success_withdraw_quat_wxyz is not None
+        assert self.success_withdraw_start_time_ns is not None
+        now_ns = self.get_clock().now().nanoseconds
+        elapsed_s = (now_ns - self.success_withdraw_start_time_ns) * 1.0e-9
+        if elapsed_s >= self.SUCCESS_WITHDRAW_TIMEOUT_S:
+            self.stop_episode(
+                "FAILURE", "成功后撤回超时，取消自动归位。", self.success_withdraw_start_spoon
+            )
+            return
+        if self.data_is_stale() or (not self.args.dry_run and not self.ros_control_is_ready()):
+            self.success_withdraw_stable_steps = 0
+            return
+        ee_pose = self.lookup_ee_pose(require_fresh=True)
+        if ee_pose is None:
+            self.success_withdraw_stable_steps = 0
+            return
+        ee_pos, ee_quat_wxyz = ee_pose
+        if not (
+            np.all(np.isfinite(ee_pos))
+            and np.all(np.isfinite(ee_quat_wxyz))
+            and float(np.linalg.norm(ee_quat_wxyz)) > 1.0e-6
+            and self.current_joint_pos is not None
+            and np.all(np.isfinite(self.current_joint_pos))
+        ):
+            self.stop_episode("FAILURE", "成功后撤回反馈无效，取消自动归位。", self.success_withdraw_start_spoon)
+            return
+        spoon_center = ee_pos + quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
+        self.last_fsm_metrics = self.compute_fsm_metrics(spoon_center, ee_quat_wxyz)
+        direction = self.success_withdraw_direction
+        displacement = spoon_center - self.success_withdraw_start_spoon
+        progress = float(np.dot(displacement, direction))
+        lateral_error = float(np.linalg.norm(displacement - progress * direction))
+        goal_spoon = self.success_withdraw_start_spoon + direction * self.args.withdraw_distance
+        position_error = float(np.linalg.norm(goal_spoon - spoon_center))
+        current_rot = R.from_quat(ee_quat_wxyz[[1, 2, 3, 0]])
+        goal_rot = R.from_quat(self.success_withdraw_quat_wxyz[[1, 2, 3, 0]])
+        rotation_error = (goal_rot * current_rot.inv()).as_rotvec()
+        rotation_error_norm = float(np.linalg.norm(rotation_error))
+        if not np.all(np.isfinite([progress, lateral_error, position_error, rotation_error_norm])):
+            self.stop_episode("FAILURE", "成功后撤回反馈无效，取消自动归位。", spoon_center)
+            return
+        if (
+            lateral_error > self.SUCCESS_WITHDRAW_MAX_LATERAL_ERROR_M
+            or rotation_error_norm > self.SUCCESS_WITHDRAW_MAX_ORIENTATION_ERROR_RAD
+        ):
+            self.stop_episode(
+                "FAILURE",
+                f"成功后撤回偏离直线路径或姿态: lateral={lateral_error:.4f}m, "
+                f"rotation={math.degrees(rotation_error_norm):.2f}deg，取消自动归位。",
+                spoon_center,
+            )
+            return
+
+        pose_reached = (
+            position_error <= self.SUCCESS_WITHDRAW_POSITION_TOL_M
+            and progress >= self.args.withdraw_distance - self.SUCCESS_WITHDRAW_POSITION_TOL_M
+            and rotation_error_norm <= self.SUCCESS_WITHDRAW_ORIENTATION_TOL_RAD
+            and float(self.last_fsm_metrics["mouth_depth"]) < 0.0
+        )
+        settled = self.current_joint_vel is not None and float(np.max(np.abs(self.current_joint_vel))) < 0.03
+        self.success_withdraw_stable_steps = self.success_withdraw_stable_steps + 1 if pose_reached and settled else 0
+        if self.success_withdraw_stable_steps >= self.SUCCESS_WITHDRAW_STABLE_STEPS:
+            self.success_withdraw_complete = True
+            self.fsm_state = "DONE"
+            self.stop_episode(
+                "SUCCESS", f"成功后已沿进入方向的反方向撤回 {progress:.3f}m，开始归位。", spoon_center
+            )
+            return
+        if pose_reached:
+            return
+
+        self.get_logger().info(
+            f"成功后撤回中: actual={progress:.3f}/{self.args.withdraw_distance:.3f}m, "
+            f"lateral={lateral_error:.4f}m, elapsed={elapsed_s:.1f}s, "
+            f"trajectory_sent={self.success_withdraw_trajectory_sent}, speed_scaling_raw={self.speed_scaling}",
+            throttle_duration_sec=1.0,
+        )
+        if self.success_withdraw_trajectory_sent or self.args.dry_run:
+            return
+        try:
+            trajectory = self.plan_success_withdraw_trajectory(ee_pos, ee_quat_wxyz)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            self.stop_episode("FAILURE", f"成功后撤回轨迹规划失败: {exc}，取消自动归位。", spoon_center)
+            return
+        # 整条轨迹一次发布，中间点带连续速度，不再逐段等待反馈或重发目标。
+        self.pub.publish(trajectory)
+        self.success_withdraw_trajectory_sent = True
+        end_time = trajectory.points[-1].time_from_start
+        self.get_logger().info(
+            f"已一次下发完整撤回轨迹: distance={self.args.withdraw_distance:.3f}m, "
+            f"duration={end_time.sec + end_time.nanosec * 1e-9:.2f}s（UR速度缩放前）"
+        )
+
+    def plan_success_withdraw_trajectory(self, ee_pos: np.ndarray, ee_quat_wxyz: np.ndarray) -> JointTrajectory:
+        """预先求解整条直线路径，生成平滑起停、途中不停顿的单条轨迹。"""
+        assert self.current_joint_pos is not None
+        assert self.success_withdraw_start_spoon is not None
+        assert self.success_withdraw_direction is not None
+        assert self.success_withdraw_quat_wxyz is not None
+        initial_rot = R.from_quat(ee_quat_wxyz[[1, 2, 3, 0]])
+        goal_rot = R.from_quat(self.success_withdraw_quat_wxyz[[1, 2, 3, 0]])
+        rotation_delta = (goal_rot * initial_rot.inv()).as_rotvec()
+        initial_spoon = ee_pos + initial_rot.apply(self.SPOON_OFFSET)
+        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.args.withdraw_distance
+        distance = float(np.linalg.norm(goal_spoon - initial_spoon))
+        resolution = min(self.SUCCESS_WITHDRAW_PATH_RESOLUTION_M, self.args.max_cartesian_step / 1.5)
+        if not np.isfinite(resolution) or resolution <= 0.0:
+            raise ValueError("撤回路径采样间距必须大于零")
+        sample_count = max(20, int(math.ceil(distance / resolution)))
+        joint_path = [self.current_joint_pos.astype(np.float64).copy()]
+        initial_model_pos, initial_model_rot = self.ik.fk(joint_path[0])
+        ros_to_ik = R.from_rotvec([0.0, 0.0, math.pi])
+        previous_ee, previous_rot = ee_pos, initial_rot
+        for index in range(1, sample_count + 1):
+            fraction = index / sample_count
+            # 整段使用统一的平滑时间律，只有起点和终点速度为零。
+            fraction = fraction * fraction * (3.0 - 2.0 * fraction)
+            target_spoon = initial_spoon + fraction * (goal_spoon - initial_spoon)
+            target_rot = R.from_rotvec(fraction * rotation_delta) * initial_rot
+            target_ee = target_spoon - target_rot.apply(self.SPOON_OFFSET)
+            arm_delta = np.concatenate([target_ee - previous_ee, (target_rot * previous_rot.inv()).as_rotvec()])
+            previous_quat = previous_rot.as_quat()[[3, 0, 1, 2]]
+            safe, reason = self.delta_safety_status(previous_ee, previous_quat, arm_delta)
+            if not safe:
+                raise ValueError(reason)
+            target_model_pos = initial_model_pos + ros_to_ik.apply(target_ee - ee_pos)
+            target_model_rot = ros_to_ik * target_rot * initial_rot.inv() * ros_to_ik.inv() * initial_model_rot
+            joint_target = joint_path[-1].copy()
+            # 小增量 IK 只用于发布前的数值求解，不会逐步驱动实机。
+            for _ in range(40):
+                model_pos, model_rot = self.ik.fk(joint_target)
+                error = np.concatenate([target_model_pos - model_pos, (target_model_rot * model_rot.inv()).as_rotvec()])
+                if np.linalg.norm(error[:3]) <= 0.00005 and np.linalg.norm(error[3:]) <= 0.0001:
+                    break
+                joint_target = self.ik.joint_target_from_delta(
+                    joint_target, error, max_joint_step=self.args.max_joint_step
+                )
+                if not np.all(np.isfinite(joint_target)):
+                    raise ValueError("IK 关节目标无效")
+            else:
+                raise ValueError("直线撤回 IK 未收敛")
+            if np.max(np.abs(joint_target - joint_path[-1])) > self.args.max_joint_step + self.SAFETY_EPS:
+                raise ValueError("撤回路径相邻采样点关节变化过大")
+            joint_path.append(joint_target)
+            previous_ee, previous_rot = target_ee, target_rot
+
+        positions = np.asarray(joint_path)
+        derivatives = np.gradient(positions, axis=0)
+        derivatives[[0, -1]] = 0.0
+        # 三次 Hermite 插值的速度是二次 Bezier 曲线；用其控制点上界
+        # 计算整段时长，保证采样点之间也满足每个关节的速度限制。
+        velocity_bounds = np.maximum.reduce([
+            np.abs(derivatives[:-1]), np.abs(derivatives[1:]),
+            np.abs(3.0 * np.diff(positions, axis=0) - derivatives[:-1] - derivatives[1:]),
+        ])
+        duration_s = max(
+            self.args.min_trajectory_duration,
+            distance / self.SUCCESS_WITHDRAW_SPEED_M_S,
+            sample_count * float(np.max(velocity_bounds / self.JOINT_MAX_VELOCITIES_RAD_S)),
+        )
+        interval_s = duration_s / sample_count
+        trajectory = JointTrajectory()
+        trajectory.joint_names = list(self.JOINT_NAMES)
+        for index, (position, derivative) in enumerate(zip(positions, derivatives)):
+            point = JointTrajectoryPoint()
+            point.positions = position.tolist()
+            point.velocities = (derivative / interval_s).tolist()
+            time_ns = round(index * interval_s * 1e9)
+            point.time_from_start = Duration(sec=time_ns // 1_000_000_000, nanosec=time_ns % 1_000_000_000)
+            trajectory.points.append(point)
+
+        # 下发前检查控制器在采样点之间的实际关节插值，避免长勺走弧线或越界。
+        for index in range(sample_count):
+            for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+                h00 = 2.0 * fraction**3 - 3.0 * fraction**2 + 1.0
+                h10 = fraction**3 - 2.0 * fraction**2 + fraction
+                h01 = -2.0 * fraction**3 + 3.0 * fraction**2
+                h11 = fraction**3 - fraction**2
+                joints = (h00 * positions[index] + h10 * derivatives[index]
+                          + h01 * positions[index + 1] + h11 * derivatives[index + 1])
+                model_pos, model_rot = self.ik.fk(joints)
+                predicted_ee = ee_pos + ros_to_ik.inv().apply(model_pos - initial_model_pos)
+                predicted_rot = ros_to_ik.inv() * model_rot * initial_model_rot.inv() * ros_to_ik * initial_rot
+                predicted_spoon = predicted_ee + predicted_rot.apply(self.SPOON_OFFSET)
+                displacement = predicted_spoon - self.success_withdraw_start_spoon
+                progress = float(displacement @ self.success_withdraw_direction)
+                lateral = np.linalg.norm(displacement - progress * self.success_withdraw_direction)
+                if not (
+                    np.all(joints >= self.ik.lower_limits) and np.all(joints <= self.ik.upper_limits)
+                    and np.all(predicted_ee >= self.WORKSPACE_MIN) and np.all(predicted_ee <= self.WORKSPACE_MAX)
+                    and np.all(predicted_spoon >= self.WORKSPACE_MIN) and np.all(predicted_spoon <= self.WORKSPACE_MAX)
+                    and lateral <= self.SUCCESS_WITHDRAW_MAX_LATERAL_ERROR_M
+                    and (goal_rot * predicted_rot.inv()).magnitude() <= self.SUCCESS_WITHDRAW_MAX_ORIENTATION_ERROR_RAD
+                ):
+                    raise ValueError("撤回轨迹插值超出关节/工作空间限制或偏离直线路径")
+        return trajectory
 
     def compute_fsm_metrics(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> dict[str, float | bool]:
         assert self.mouth_pos is not None
@@ -1901,27 +2173,79 @@ class ArmPolicyDeployNode(Node):
             f"[episode {reason_type}] {reason}; state={self.fsm_state}, steps={self.policy_step}, "
             f"mouth-spoon={np.round(mouth_delta, 4) if mouth_delta is not None else 'n/a'}{metrics_msg}"
         )
+        if reason_type == "SUCCESS" and self.start_reset_after_success():
+            # 撤回确认到位后立即归位；绘图延后，避免阻塞轨迹衔接和归位期间的关节记录。
+            return
+        if not self.args.dry_run and self.current_joint_pos is not None and np.all(np.isfinite(self.current_joint_pos)):
+            self.publish_joint_target(self.current_joint_pos)
         self.save_safety_gain_curve_outputs(reason_type)
         self.save_joint_angle_curve()
-        if not self.args.dry_run and self.current_joint_pos is not None:
-            self.publish_joint_target(self.current_joint_pos)
-        if reason_type == "SUCCESS":
-            self.start_reset_after_success()
 
-    def start_reset_after_success(self) -> None:
-        if not self.RESET_AFTER_SUCCESS or self.args.dry_run or self.reset_started:
-            return
+    def start_reset_after_success(self) -> bool:
+        if not self.RESET_AFTER_SUCCESS or self.args.dry_run or self.reset_started or not self.success_withdraw_complete:
+            return False
+        if self.current_joint_pos is None or not np.all(np.isfinite(self.current_joint_pos)):
+            self.get_logger().error("归位起始关节反馈无效，取消自动归位。")
+            return False
+        # 使用当前已连接的 publisher，保持 reset_arm.py 默认的 0.25 rad/s、最短 4 s。
+        joint_move = np.abs(self.DEFAULT_JOINT_POS - self.current_joint_pos)
+        duration_s = max(
+            self.RESET_MIN_DURATION_S, self.args.min_trajectory_duration,
+            float(np.max(joint_move)) / self.RESET_MAX_JOINT_VELOCITY_RAD_S,
+        )
+        scaling = float(self.speed_scaling) if self.speed_scaling is not None else 1.0
+        if scaling > 1.0:
+            scaling /= 100.0
+        self.reset_timeout_s = duration_s / max(scaling, 0.01) + self.RESET_TIMEOUT_MARGIN_S
         self.reset_started = True
-        reset_script = PROJECT_ROOT / "deploy" / "reset_arm.py"
-        cmd = [sys.executable, str(reset_script), "--execute"]
-        try:
-            subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
-        except OSError as exc:
-            self.get_logger().error(f"成功后启动归位失败: cmd={cmd}, error={exc}")
-            return
-        self.get_logger().warn(f"成功条件稳定满足，已启动自动归位: {' '.join(cmd)}")
+        self.reset_finished = False
+        self.reset_start_time_ns = self.get_clock().now().nanoseconds
+        self.reset_reached_since_ns = None
+        self.fsm_state = "RESET"
+        self.publish_joint_target(self.DEFAULT_JOINT_POS, min_duration_s=duration_s)
+        self.get_logger().info(f"成功撤回已确认，已直接下发归位轨迹: duration={duration_s:.2f}s（UR速度缩放前）。")
+        return True
 
-    def lookup_ee_pose(self) -> tuple[np.ndarray, np.ndarray] | None:
+    def update_reset_after_success(self) -> None:
+        """只监测归位，不重发轨迹；结束后再绘图，关节 CSV 全程继续记录。"""
+        assert self.reset_start_time_ns is not None
+        now_ns = self.get_clock().now().nanoseconds
+        elapsed_s = (now_ns - self.reset_start_time_ns) * 1e-9
+        feedback_valid = (
+            self.current_joint_pos is not None
+            and np.all(np.isfinite(self.current_joint_pos))
+            and self.last_joint_state_time_ns is not None
+            and (now_ns - self.last_joint_state_time_ns) * 1e-9 <= self.args.joint_state_timeout
+        )
+        settled = (
+            self.current_joint_vel is not None and np.all(np.isfinite(self.current_joint_vel))
+            and float(np.max(np.abs(self.current_joint_vel))) < 0.03
+        )
+        reached = (
+            feedback_valid
+            and float(np.max(np.abs(self.DEFAULT_JOINT_POS - self.current_joint_pos))) <= self.RESET_GOAL_TOL_RAD
+        )
+        if reached and settled:
+            if self.reset_reached_since_ns is None:
+                self.reset_reached_since_ns = now_ns
+            if (now_ns - self.reset_reached_since_ns) * 1e-9 < self.RESET_SETTLE_TIME_S:
+                return
+            self.reset_finished = True
+            self.fsm_state = "DONE"
+            self.get_logger().info("自动归位完成，开始保存曲线。")
+        elif elapsed_s >= self.reset_timeout_s:
+            self.reset_finished = True
+            self.fsm_state = "RESET_FAILED"
+            if feedback_valid:
+                self.publish_joint_target(self.current_joint_pos)
+            self.get_logger().error(f"自动归位超时: elapsed={elapsed_s:.1f}s，停止等待并保存曲线。")
+        else:
+            self.reset_reached_since_ns = None
+            return
+        self.save_safety_gain_curve_outputs("SUCCESS")
+        self.save_joint_angle_curve()
+
+    def lookup_ee_pose(self, require_fresh: bool = False) -> tuple[np.ndarray, np.ndarray] | None:
         try:
             transform = self.tf_buffer.lookup_transform(self.target_frame, self.ee_frame, rclpy.time.Time(), timeout=RclpyDuration(seconds=0.05))
         except tf2_ros.TransformException as exc:
@@ -1930,6 +2254,12 @@ class ArmPolicyDeployNode(Node):
                 self.warned_missing_tf = True
             return None
 
+        if require_fresh:
+            stamp_ns = transform.header.stamp.sec * 1_000_000_000 + transform.header.stamp.nanosec
+            age_s = (self.get_clock().now().nanoseconds - stamp_ns) * 1.0e-9
+            if abs(age_s) > self.args.joint_state_timeout:
+                self.get_logger().warn(f"撤回阶段 TF 超时 {age_s:.2f}s，暂停撤回。", throttle_duration_sec=1.0)
+                return None
         trans = transform.transform.translation
         rot = transform.transform.rotation
         ee_pos = np.array([trans.x, trans.y, trans.z], dtype=np.float32)
@@ -2240,7 +2570,7 @@ class ArmPolicyDeployNode(Node):
     def delta_is_safe(self, ee_pos: np.ndarray, ee_quat_wxyz: np.ndarray, arm_delta: np.ndarray) -> bool:
         return self.delta_safety_status(ee_pos, ee_quat_wxyz, arm_delta)[0]
 
-    def publish_joint_target(self, joint_target: np.ndarray) -> None:
+    def publish_joint_target(self, joint_target: np.ndarray, min_duration_s: float = 0.0) -> None:
         assert self.current_joint_pos is not None
         point = JointTrajectoryPoint()
         point.positions = [float(joint_target[self.JOINT_NAME_TO_IDX[name]]) for name in self.JOINT_NAMES]
@@ -2248,7 +2578,7 @@ class ArmPolicyDeployNode(Node):
         joint_move = np.abs(joint_target - self.current_joint_pos)
         # 每个关节按自己的速度上限计算所需时间，整条轨迹采用其中最大值以保证所有关节都不超速。
         joint_durations = joint_move / np.maximum(self.JOINT_MAX_VELOCITIES_RAD_S, 1.0e-6)
-        duration_s = max(self.args.min_trajectory_duration, float(np.max(joint_durations)))
+        duration_s = max(self.args.min_trajectory_duration, min_duration_s, float(np.max(joint_durations)))
         sec = int(duration_s)
         nanosec = int((duration_s - sec) * 1.0e9)
         point.time_from_start = Duration(sec=sec, nanosec=nanosec)
@@ -2286,7 +2616,7 @@ class ArmPolicyDeployNode(Node):
 
     def data_is_stale(self) -> bool:
         now_ns = self.get_clock().now().nanoseconds
-        if not self.args.fixed_mouth_pose:
+        if not self.args.fixed_mouth_pose and self.fsm_state != "SUCCESS_WITHDRAW":
             if self.last_face_time_ns is None or (now_ns - self.last_face_time_ns) * 1.0e-9 > self.args.target_timeout:
                 self.get_logger().warn("视觉目标超时，暂停发布策略动作。", throttle_duration_sec=1.0)
                 return True
@@ -2338,7 +2668,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--min-speed-scaling", type=float, default=0.01, help="Do not publish motion commands unless UR speed scaling is at least this value.")
     parser.add_argument("--episode-length-s", type=float, default=240.0, help="Deployment episode timeout in seconds, matching simulation.")
     parser.add_argument("--max-episode-steps", type=int, default=0, help="Deployment episode timeout in policy steps; <=0 uses episode_length_s * control_hz.")
-    parser.add_argument("--withdraw-distance", type=float, default=0.10, help=argparse.SUPPRESS)
+    parser.add_argument("--withdraw-distance", type=float, default=0.10, help="Straight withdrawal distance in meters before automatic reset after success.")
     parser.add_argument("--feed-hold-steps", type=int, default=5, help=argparse.SUPPRESS)
     parser.add_argument("--bite-release-steps", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--min-spoon-z", type=float, default=0.06, help="Episode failure threshold for spoon center height in target-frame meters.")
@@ -2359,6 +2689,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         app_args = argv
         ros_args = []
     args = parser.parse_args(app_args)
+    if not math.isfinite(args.withdraw_distance) or args.withdraw_distance < ArmPolicyDeployNode.FEED_INSERT_DEPTH_MAX_M:
+        parser.error("--withdraw-distance 必须是有限数且不小于最大入嘴深度 0.08m，确保归位前勺心已退出嘴平面。")
     if args.bite_release_steps is not None and args.feed_hold_steps == 5:
         args.feed_hold_steps = args.bite_release_steps
     args.wrench_bias_samples = max(0, int(args.wrench_bias_samples))
