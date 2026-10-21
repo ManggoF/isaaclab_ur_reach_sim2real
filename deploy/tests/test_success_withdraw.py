@@ -1,4 +1,4 @@
-"""Offline withdrawal checks; no ROS node, publisher, or robot connection is created."""
+"""Offline withdrawal tests; no ROS node, publisher, or robot connection is created."""
 
 import math
 from types import SimpleNamespace
@@ -43,6 +43,7 @@ class OfflineDeployNode(ArmPolicyDeployNode):
         self.mouth_axis /= np.linalg.norm(self.mouth_axis)
         self.target_received = True
         self.episode_stopped = False
+        self.episode_stop_reason = None
         self.episode_start_time_ns = self.now_ns
         self.reset_started = False
         self.reset_finished = False
@@ -60,12 +61,21 @@ class OfflineDeployNode(ArmPolicyDeployNode):
         self.success_withdraw_stable_steps = 0
         self.success_withdraw_complete = False
         self.success_withdraw_trajectory_sent = False
+        self.safety_strengthen_active = False
+        self.withdrawal_reason = "SUCCESS"
+        self.withdraw_distance_m = self.args.withdraw_distance
         self.speed_scaling = 1.0
         self.previous_arm_action = np.zeros(6)
         self.previous_safety_action = np.zeros(3)
         self.safety_slow_active = False
         self.rule_safety_retreat_active = False
         self.rule_safety_retreat_steps = 0
+        self.rule_safety_enabled = False
+        self.learned_safety_enabled = False
+        self.rule_safety_last_state = self.default_rule_safety_state()
+        self.save_full_safety_gain_curve = True
+        self.safety_gain_curve_rows = []
+        self.update_safety_gain_visualization = Mock()
         self.policy_step = 0
         self.last_fsm_metrics = {}
         self.last_joint_state_time_ns = self.now_ns

@@ -139,6 +139,9 @@ class ArmPolicyDeployNode(Node):
     # 规则安全层配置集中写在代码里，实机调参时直接改这里，避免部署命令行越来越长。
     # 开关与可视化: 控制规则层是否接管动作，以及是否显示/保存三通道增益图像。
     RULE_SAFETY_ENABLED = False
+    safety_strenthen = True  # True: 有效 grec > 0 后锁定撤回 10 cm 再归位；False: 保持原安全策略。
+    safety_grec_force_one = False  # 加强模式记录：True 固定 grec=1；False 记录原安全策略增益。
+    SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M = 0.10
     SAFETY_GAIN_VISUALIZATION = True
     SAVE_SAFETY_GAIN_IMAGES = True
     SAFETY_GAIN_HISTORY = 300
@@ -252,6 +255,7 @@ class ArmPolicyDeployNode(Node):
         self.policy_step = 0
         self.episode_start_time_ns: int | None = None
         self.episode_stopped = False
+        self.episode_stop_reason: str | None = None
         self.reset_started = False
         self.reset_finished = False
         self.reset_start_time_ns: int | None = None
@@ -268,6 +272,9 @@ class ArmPolicyDeployNode(Node):
         self.success_withdraw_stable_steps = 0
         self.success_withdraw_complete = False
         self.success_withdraw_trajectory_sent = False
+        self.safety_strengthen_active = False
+        self.withdrawal_reason = "SUCCESS"
+        self.withdraw_distance_m = float(args.withdraw_distance)
         self.last_fsm_metrics: dict[str, float | bool] = {}
         self.max_episode_steps = (
             args.max_episode_steps
@@ -294,6 +301,7 @@ class ArmPolicyDeployNode(Node):
         self.save_full_safety_gain_curve = bool(self.SAVE_FULL_SAFETY_GAIN_CURVE)
         self.safety_gain_history_len = max(2, int(self.SAFETY_GAIN_HISTORY))
         self.safety_gain_image_interval = max(1, int(self.SAFETY_GAIN_IMAGE_INTERVAL))
+        self.safety_gain_visualization_step = 0
         self.safety_gain_curve_rows: list[dict[str, float | str | bool]] = []  # 论文图: 保存完整 episode 的三增益和风险量，用于结束时画全程曲线。
         self.safety_gain_curve_saved = False  # 论文图: 防止 stop_episode 和 Ctrl-C 清理时重复写同一条曲线。
         self.rule_safety_retreat_active = False  # 规则/策略安全层共用: 危险触发后锁存撤回，直到净空和力觉都恢复安全。
@@ -354,6 +362,12 @@ class ArmPolicyDeployNode(Node):
 
         mode = "dry-run，只打印不发关节轨迹" if args.dry_run else "motion enabled，会发布关节轨迹"
         self.get_logger().info(f"arm policy 部署节点已启动: {mode}")
+        self.get_logger().info(
+            f"safety_strenthen={self.safety_strenthen}: "
+            "开启时有效 grec > 0 即锁定撤回 10 cm 再归位；"
+            f"safety_grec_force_one={self.safety_grec_force_one} "
+            f"（grec记录模式: {'固定为1' if self.safety_grec_force_one else '原安全策略输出'}）。"
+        )
         self.get_logger().info(f"policy request: {Path(args.model_path).expanduser().resolve()}")
         self.get_logger().info(f"policy loaded: {self.policy.loaded_path}")
         self.get_logger().info(f"policy backend: {self.policy.backend}")
@@ -609,7 +623,7 @@ class ArmPolicyDeployNode(Node):
                     "safety_mode",
                     "safety_slow_gain",
                     "safety_center_gain",
-                    "safety_retreat_gain",
+                    "safety_grec",
                     "safety_danger_score",
                     "safety_spoon_radial",
                     "safety_mouth_depth",
@@ -665,7 +679,7 @@ class ArmPolicyDeployNode(Node):
                 str(safety_state["mode"]),
                 float(safety_state["slow_gain"]),
                 float(safety_state["center_gain"]),
-                float(safety_state["retreat_gain"]),
+                float(safety_state["grec"]),
                 float(safety_state["danger_score"]),
                 float(safety_state["spoon_radial"]),
                 float(safety_state["mouth_depth"]),
@@ -695,6 +709,7 @@ class ArmPolicyDeployNode(Node):
             "slow_gain": 0.0,
             "center_gain": 0.0,
             "retreat_gain": 0.0,
+            "grec": 0.0,
             "danger_score": 0.0,
             "lip_risk": 0.0,
             "link_risk": 0.0,
@@ -1094,9 +1109,7 @@ class ArmPolicyDeployNode(Node):
             }
         )
         self.previous_safety_action = safety_action.copy()
-        self.rule_safety_last_state = safety_state
-        self.record_safety_gain_curve_sample(safety_state)
-        self.update_safety_gain_visualization(safety_state)
+        self.publish_safety_state(safety_state)
         return arm_delta, safety_state
 
     def apply_rule_based_safety_filter(
@@ -1292,10 +1305,70 @@ class ArmPolicyDeployNode(Node):
             "policy_delta_norm": lin_norm,
             "final_delta_norm": filtered_norm,
         }
+        self.publish_safety_state(safety_state)
+        return arm_delta, safety_state
+
+    def publish_safety_state(self, safety_state: dict[str, object]) -> None:
+        """记录值与触发值分开，切换 grec 记录模式不会改变撤回/归位控制。"""
+        original_gain = float(safety_state["retreat_gain"])
+        safety_state["grec"] = original_gain
+        pending_strengthen = self.safety_strenthen and not self.episode_stopped and original_gain > 0.0
+        if self.safety_strengthen_active or pending_strengthen:
+            # 保留原策略的危险锁存和 retreat_gain，供后续推理和首次接管判断使用。
+            safety_state.update({
+                "mode": "SAFETY_RESET" if self.reset_started else "SAFETY_WITHDRAW",
+                "slow_gain": 0.0, "center_gain": 0.0,
+                "grec": 1.0 if self.safety_grec_force_one else original_gain,
+                "retreat_active": True,
+            })
         self.rule_safety_last_state = safety_state
         self.record_safety_gain_curve_sample(safety_state)
         self.update_safety_gain_visualization(safety_state)
-        return arm_delta, safety_state
+
+    def maybe_start_safety_strengthen(
+        self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray, safety_state: dict[str, object]
+    ) -> bool:
+        """有效 grec 首次触发后接管整条轨迹，当前策略动作不再下发。"""
+        if not self.safety_strenthen or float(safety_state["retreat_gain"]) <= 0.0:
+            return False
+        if self.safety_strengthen_active:
+            return True
+        self.get_logger().warn(
+            "安全加强模式触发: 有效 grec > 0，停止策略接近，立即撤回 10 cm 后归位；"
+            f"grec记录模式={'固定为1' if self.safety_grec_force_one else '原安全策略输出'}。"
+        )
+        self.start_success_withdraw(spoon_center, ee_quat_wxyz, safety_triggered=True)
+        if not self.episode_stopped:
+            self.update_success_withdraw()
+        return True
+
+    def update_strengthened_safety_state(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> None:
+        """持续记录增益；原输出模式只运行 safety 推理，忽略其运动动作。"""
+        if not self.safety_strengthen_active:
+            return
+        if self.learned_safety_enabled:
+            if self.safety_grec_force_one:
+                safety_state = self.compute_safety_policy_state(ee_quat_wxyz, spoon_center)
+            else:
+                self.compute_wrist_wrench_observation()
+                ee_pos = spoon_center - quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
+                self.apply_learned_safety_filter(ee_pos, ee_quat_wxyz, spoon_center, np.zeros(6, dtype=np.float32))
+                return
+        elif self.rule_safety_enabled:
+            ee_pos = spoon_center - quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
+            # 仅计算当前风险/记录 grec，不发布该规则动作。
+            self.apply_rule_based_safety_filter(ee_pos, ee_quat_wxyz, spoon_center, np.zeros(6, dtype=np.float32))
+            return
+        else:
+            safety_state = self.rule_safety_last_state.copy()
+            metrics = self.compute_fsm_metrics(spoon_center, ee_quat_wxyz)
+            safety_state.update({
+                "spoon_mouth_dist": metrics["mouth_spoon_dist"],
+                "spoon_radial": metrics["radial"], "mouth_depth": metrics["mouth_depth"],
+            })
+        self.rule_safety_retreat_steps += 1
+        safety_state["retreat_steps"] = self.rule_safety_retreat_steps
+        self.publish_safety_state(safety_state)
 
     @staticmethod
     def draw_gain_bar(canvas: np.ndarray, top_left: tuple[int, int], width: int, label: str, value: float, color: tuple[int, int, int]) -> None:
@@ -1325,7 +1398,7 @@ class ArmPolicyDeployNode(Node):
                 "time_s": float(time_s),
                 "gslow": float(safety_state["slow_gain"]),
                 "glat": float(safety_state["center_gain"]),
-                "gret": float(safety_state["retreat_gain"]),
+                "grec": float(safety_state["grec"]),
                 "danger_score": float(safety_state["danger_score"]),
                 "lip_risk": float(safety_state["lip_risk"]),
                 "link_risk": float(safety_state["link_risk"]),
@@ -1358,7 +1431,7 @@ class ArmPolicyDeployNode(Node):
             "time_s",
             "gslow",
             "glat",
-            "gret",
+            "grec",
             "danger_score",
             "lip_risk",
             "link_risk",
@@ -1398,7 +1471,7 @@ class ArmPolicyDeployNode(Node):
             return np.zeros((0, 3), dtype=np.float32)
         return np.asarray(
             [
-                [float(row["gslow"]), float(row["glat"]), float(row["gret"])]
+                [float(row["gslow"]), float(row["glat"]), float(row["grec"])]
                 for row in rows
             ],
             dtype=np.float32,
@@ -1493,9 +1566,10 @@ class ArmPolicyDeployNode(Node):
             plot_rows = self.build_safety_gain_curve_plot_rows()
             stage_x = self.build_safety_gain_curve_stage_axis(plot_rows)
             fig, axis = plt.subplots(figsize=(9.0, 4.8))
-            axis.plot(stage_x, [float(row["gslow"]) for row in plot_rows], color="#1f77b4", linewidth=2.1)
-            axis.plot(stage_x, [float(row["glat"]) for row in plot_rows], color="#2ca02c", linewidth=2.1)
-            axis.plot(stage_x, [float(row["gret"]) for row in plot_rows], color="#d62728", linewidth=2.1)
+            axis.plot(stage_x, [float(row["gslow"]) for row in plot_rows], color="#1f77b4", linewidth=2.1, label="gslow")
+            axis.plot(stage_x, [float(row["glat"]) for row in plot_rows], color="#2ca02c", linewidth=2.1, label="glat")
+            axis.plot(stage_x, [float(row["grec"]) for row in plot_rows], color="#d62728", linewidth=2.1, label="grec")
+            axis.legend()
             for boundary in (1.0, 2.0):
                 axis.axvline(boundary, color="#b0b0b0", linestyle="--", linewidth=1.0, alpha=0.45)
             axis.set_xlim(0.0, 3.0)
@@ -1549,7 +1623,7 @@ class ArmPolicyDeployNode(Node):
             for key, color in (
                 ("gslow", (180, 119, 31)),
                 ("glat", (44, 160, 44)),
-                ("gret", (40, 39, 214)),
+                ("grec", (40, 39, 214)),
             ):
                 values = np.asarray([float(row[key]) for row in plot_rows], dtype=np.float32)
                 if values.size < 2:
@@ -1565,9 +1639,10 @@ class ArmPolicyDeployNode(Node):
 
     def update_safety_gain_visualization(self, safety_state: dict[str, float | str | bool]) -> None:
         """把安全层三个增益画成实时条形图和曲线，体现 safety filter 的作用。"""
+        self.safety_gain_visualization_step += 1
         self.safety_gain_history["slow"].append(float(safety_state["slow_gain"]))
         self.safety_gain_history["center"].append(float(safety_state["center_gain"]))
-        self.safety_gain_history["retreat"].append(float(safety_state["retreat_gain"]))
+        self.safety_gain_history["retreat"].append(float(safety_state["grec"]))
         if not self.safety_gain_visualization_enabled and not self.save_safety_gain_images:
             return
         if cv2 is None:
@@ -1575,7 +1650,7 @@ class ArmPolicyDeployNode(Node):
 
         try:
             canvas = np.full((460, 760, 3), 18, dtype=np.uint8)
-            cv2.putText(canvas, "Safety Gains: gslow / glat / gret", (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas, "Safety Gains: gslow / glat / grec", (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(
                 canvas,
                 f"mode={safety_state['mode']}  zone={'ON' if safety_state['safety_zone'] else 'OFF'}  "
@@ -1589,7 +1664,7 @@ class ArmPolicyDeployNode(Node):
             )
             self.draw_gain_bar(canvas, (24, 108), 440, "gslow", float(safety_state["slow_gain"]), (0, 215, 255))
             self.draw_gain_bar(canvas, (24, 145), 440, "glat", float(safety_state["center_gain"]), (80, 220, 120))
-            self.draw_gain_bar(canvas, (24, 182), 440, "gret", float(safety_state["retreat_gain"]), (70, 90, 255))
+            self.draw_gain_bar(canvas, (24, 182), 440, "grec", float(safety_state["grec"]), (70, 90, 255))
             cv2.putText(
                 canvas,
                 f"dist={safety_state['spoon_mouth_dist']*1000.0:.1f}mm  radial={safety_state['spoon_radial']*1000.0:.1f}mm  "
@@ -1646,7 +1721,7 @@ class ArmPolicyDeployNode(Node):
                 except Exception as exc:
                     self.safety_gain_visualization_enabled = False
                     self.get_logger().warn(f"安全增益窗口显示失败，已关闭窗口显示: {exc}", throttle_duration_sec=2.0)
-            if self.save_safety_gain_images and self.policy_step % self.safety_gain_image_interval == 0:
+            if self.save_safety_gain_images and self.safety_gain_visualization_step % self.safety_gain_image_interval == 0:
                 cv2.imwrite(str(SAFETY_GAIN_VIS_DIR / "latest_safety_gains.png"), canvas)
         except Exception as exc:
             self.safety_gain_visualization_enabled = False
@@ -1679,7 +1754,7 @@ class ArmPolicyDeployNode(Node):
             return
         if self.episode_stopped:
             return
-        if self.fsm_state == "SUCCESS_WITHDRAW":
+        if self.fsm_state in {"SUCCESS_WITHDRAW", "SAFETY_WITHDRAW"}:
             self.update_success_withdraw()
             return
         if self.data_is_stale():
@@ -1735,6 +1810,8 @@ class ArmPolicyDeployNode(Node):
                 spoon_center,
                 arm_delta,
             )
+        if self.maybe_start_safety_strengthen(spoon_center, ee_quat_wxyz, safety_state):
+            return
         arm_delta_ik = self.ros_delta_to_ik_delta(arm_delta)
         mouth_axis_raw = self.compute_mouth_axis(invert=False)
         mouth_axis = self.compute_mouth_axis()
@@ -1787,7 +1864,7 @@ class ArmPolicyDeployNode(Node):
                 f"command_action={np.round(command_action, 3)}, "
                 f"safety_gain=[slow={safety_state['slow_gain']:.2f}, "
                 f"center={safety_state['center_gain']:.2f}, "
-                f"retreat={safety_state['retreat_gain']:.2f}], "
+                f"grec={safety_state['grec']:.2f}], "
                 f"joint_target(deg)={np.round(np.rad2deg(joint_target), 1)}",
                 throttle_duration_sec=0.5,
             )
@@ -1862,19 +1939,30 @@ class ArmPolicyDeployNode(Node):
         if self.success_hold_steps >= self.SUCCESS_HOLD_STEPS_AFTER_REACHED:
             self.start_success_withdraw(spoon_center, ee_quat_wxyz)
 
-    def start_success_withdraw(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> None:
-        """锁定成功时的进入轴和姿态，在归位前先把勺子沿原轴直线撤出。"""
+    def start_success_withdraw(
+        self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray, *, safety_triggered: bool = False
+    ) -> None:
+        """成功或安全接管时锁定进入轴和姿态，在归位前先沿原轴直线撤出。"""
+        self.safety_strengthen_active = safety_triggered
+        self.withdrawal_reason = "SAFETY" if safety_triggered else "SUCCESS"
+        self.withdraw_distance_m = (
+            self.SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M if safety_triggered else float(self.args.withdraw_distance)
+        )
+        withdraw_label = "安全加强" if safety_triggered else "成功后"
+        self.previous_arm_action.fill(0.0)
+        if not safety_triggered:
+            self.previous_safety_action.fill(0.0)
         if not (
             np.all(np.isfinite(spoon_center))
             and np.all(np.isfinite(ee_quat_wxyz))
             and float(np.linalg.norm(ee_quat_wxyz)) > 1.0e-6
         ):
-            self.stop_episode("FAILURE", "成功后撤回起始位姿无效，取消自动归位。", spoon_center)
+            self.stop_episode("FAILURE", f"{withdraw_label}撤回起始位姿无效，取消自动归位。", spoon_center)
             return
         direction = -np.asarray(self.compute_mouth_axis(), dtype=np.float64)
         direction_norm = float(np.linalg.norm(direction))
         if not np.isfinite(direction_norm) or direction_norm < 1.0e-6:
-            self.stop_episode("FAILURE", "成功后撤回失败: 嘴巴轴向无效，取消自动归位。", spoon_center)
+            self.stop_episode("FAILURE", f"{withdraw_label}撤回失败: 嘴巴轴向无效，取消自动归位。", spoon_center)
             return
         self.success_withdraw_start_spoon = np.asarray(spoon_center, dtype=np.float64).copy()
         self.success_withdraw_direction = direction / direction_norm
@@ -1883,9 +1971,9 @@ class ArmPolicyDeployNode(Node):
         self.success_withdraw_stable_steps = 0
         self.success_withdraw_complete = False
         self.success_withdraw_trajectory_sent = False
-        self.fsm_state = "SUCCESS_WITHDRAW"
+        self.fsm_state = "SAFETY_WITHDRAW" if safety_triggered else "SUCCESS_WITHDRAW"
 
-        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.args.withdraw_distance
+        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.withdraw_distance_m
         goal_ee = goal_spoon - quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
         if not (
             np.all(np.isfinite(goal_ee))
@@ -1894,19 +1982,19 @@ class ArmPolicyDeployNode(Node):
             and np.all(goal_spoon >= self.WORKSPACE_MIN)
             and np.all(goal_spoon <= self.WORKSPACE_MAX)
         ):
-            self.stop_episode("FAILURE", "成功后撤回目标超出工作空间，取消自动归位。", spoon_center)
+            self.stop_episode("FAILURE", f"{withdraw_label}撤回目标超出工作空间，取消自动归位。", spoon_center)
             return
         self.get_logger().warn(
-            "成功后先直线撤回再归位: "
-            f"distance={self.args.withdraw_distance:.3f}m, speed={self.SUCCESS_WITHDRAW_SPEED_M_S:.3f}m/s, "
+            f"{withdraw_label}先直线撤回再归位: "
+            f"distance={self.withdraw_distance_m:.3f}m, speed={self.SUCCESS_WITHDRAW_SPEED_M_S:.3f}m/s, "
             f"direction={np.round(self.success_withdraw_direction, 4)}, goal_spoon={np.round(goal_spoon, 4)}；"
             "一次下发完整连续轨迹，保持末端姿态，等待实际反馈到位。"
         )
         if self.args.dry_run:
             self.fsm_state = "DONE"
             self.stop_episode(
-                "SUCCESS",
-                "dry-run: 已预览成功后撤回目标，不发布撤回或归位轨迹。",
+                self.withdrawal_reason,
+                f"dry-run: 已预览{withdraw_label}撤回目标，不发布撤回或归位轨迹。",
                 spoon_center,
             )
 
@@ -1916,11 +2004,12 @@ class ArmPolicyDeployNode(Node):
         assert self.success_withdraw_direction is not None
         assert self.success_withdraw_quat_wxyz is not None
         assert self.success_withdraw_start_time_ns is not None
+        withdraw_label = "安全加强" if self.withdrawal_reason == "SAFETY" else "成功后"
         now_ns = self.get_clock().now().nanoseconds
         elapsed_s = (now_ns - self.success_withdraw_start_time_ns) * 1.0e-9
         if elapsed_s >= self.SUCCESS_WITHDRAW_TIMEOUT_S:
             self.stop_episode(
-                "FAILURE", "成功后撤回超时，取消自动归位。", self.success_withdraw_start_spoon
+                "FAILURE", f"{withdraw_label}撤回超时，取消自动归位。", self.success_withdraw_start_spoon
             )
             return
         if self.data_is_stale() or (not self.args.dry_run and not self.ros_control_is_ready()):
@@ -1938,7 +2027,7 @@ class ArmPolicyDeployNode(Node):
             and self.current_joint_pos is not None
             and np.all(np.isfinite(self.current_joint_pos))
         ):
-            self.stop_episode("FAILURE", "成功后撤回反馈无效，取消自动归位。", self.success_withdraw_start_spoon)
+            self.stop_episode("FAILURE", f"{withdraw_label}撤回反馈无效，取消自动归位。", self.success_withdraw_start_spoon)
             return
         spoon_center = ee_pos + quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
         self.last_fsm_metrics = self.compute_fsm_metrics(spoon_center, ee_quat_wxyz)
@@ -1946,14 +2035,14 @@ class ArmPolicyDeployNode(Node):
         displacement = spoon_center - self.success_withdraw_start_spoon
         progress = float(np.dot(displacement, direction))
         lateral_error = float(np.linalg.norm(displacement - progress * direction))
-        goal_spoon = self.success_withdraw_start_spoon + direction * self.args.withdraw_distance
+        goal_spoon = self.success_withdraw_start_spoon + direction * self.withdraw_distance_m
         position_error = float(np.linalg.norm(goal_spoon - spoon_center))
         current_rot = R.from_quat(ee_quat_wxyz[[1, 2, 3, 0]])
         goal_rot = R.from_quat(self.success_withdraw_quat_wxyz[[1, 2, 3, 0]])
         rotation_error = (goal_rot * current_rot.inv()).as_rotvec()
         rotation_error_norm = float(np.linalg.norm(rotation_error))
         if not np.all(np.isfinite([progress, lateral_error, position_error, rotation_error_norm])):
-            self.stop_episode("FAILURE", "成功后撤回反馈无效，取消自动归位。", spoon_center)
+            self.stop_episode("FAILURE", f"{withdraw_label}撤回反馈无效，取消自动归位。", spoon_center)
             return
         if (
             lateral_error > self.SUCCESS_WITHDRAW_MAX_LATERAL_ERROR_M
@@ -1961,15 +2050,17 @@ class ArmPolicyDeployNode(Node):
         ):
             self.stop_episode(
                 "FAILURE",
-                f"成功后撤回偏离直线路径或姿态: lateral={lateral_error:.4f}m, "
+                f"{withdraw_label}撤回偏离直线路径或姿态: lateral={lateral_error:.4f}m, "
                 f"rotation={math.degrees(rotation_error_norm):.2f}deg，取消自动归位。",
                 spoon_center,
             )
             return
 
+        self.update_strengthened_safety_state(spoon_center, ee_quat_wxyz)
+
         pose_reached = (
             position_error <= self.SUCCESS_WITHDRAW_POSITION_TOL_M
-            and progress >= self.args.withdraw_distance - self.SUCCESS_WITHDRAW_POSITION_TOL_M
+            and progress >= self.withdraw_distance_m - self.SUCCESS_WITHDRAW_POSITION_TOL_M
             and rotation_error_norm <= self.SUCCESS_WITHDRAW_ORIENTATION_TOL_RAD
             and float(self.last_fsm_metrics["mouth_depth"]) < 0.0
         )
@@ -1979,14 +2070,14 @@ class ArmPolicyDeployNode(Node):
             self.success_withdraw_complete = True
             self.fsm_state = "DONE"
             self.stop_episode(
-                "SUCCESS", f"成功后已沿进入方向的反方向撤回 {progress:.3f}m，开始归位。", spoon_center
+                self.withdrawal_reason, f"{withdraw_label}已沿进入方向的反方向撤回 {progress:.3f}m，开始归位。", spoon_center
             )
             return
         if pose_reached:
             return
 
         self.get_logger().info(
-            f"成功后撤回中: actual={progress:.3f}/{self.args.withdraw_distance:.3f}m, "
+            f"{withdraw_label}撤回中: actual={progress:.3f}/{self.withdraw_distance_m:.3f}m, "
             f"lateral={lateral_error:.4f}m, elapsed={elapsed_s:.1f}s, "
             f"trajectory_sent={self.success_withdraw_trajectory_sent}, speed_scaling_raw={self.speed_scaling}",
             throttle_duration_sec=1.0,
@@ -1996,14 +2087,14 @@ class ArmPolicyDeployNode(Node):
         try:
             trajectory = self.plan_success_withdraw_trajectory(ee_pos, ee_quat_wxyz)
         except (ValueError, np.linalg.LinAlgError) as exc:
-            self.stop_episode("FAILURE", f"成功后撤回轨迹规划失败: {exc}，取消自动归位。", spoon_center)
+            self.stop_episode("FAILURE", f"{withdraw_label}撤回轨迹规划失败: {exc}，取消自动归位。", spoon_center)
             return
         # 整条轨迹一次发布，中间点带连续速度，不再逐段等待反馈或重发目标。
         self.pub.publish(trajectory)
         self.success_withdraw_trajectory_sent = True
         end_time = trajectory.points[-1].time_from_start
         self.get_logger().info(
-            f"已一次下发完整撤回轨迹: distance={self.args.withdraw_distance:.3f}m, "
+            f"已一次下发完整撤回轨迹: distance={self.withdraw_distance_m:.3f}m, "
             f"duration={end_time.sec + end_time.nanosec * 1e-9:.2f}s（UR速度缩放前）"
         )
 
@@ -2017,7 +2108,7 @@ class ArmPolicyDeployNode(Node):
         goal_rot = R.from_quat(self.success_withdraw_quat_wxyz[[1, 2, 3, 0]])
         rotation_delta = (goal_rot * initial_rot.inv()).as_rotvec()
         initial_spoon = ee_pos + initial_rot.apply(self.SPOON_OFFSET)
-        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.args.withdraw_distance
+        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.withdraw_distance_m
         distance = float(np.linalg.norm(goal_spoon - initial_spoon))
         resolution = min(self.SUCCESS_WITHDRAW_PATH_RESOLUTION_M, self.args.max_cartesian_step / 1.5)
         if not np.isfinite(resolution) or resolution <= 0.0:
@@ -2152,11 +2243,13 @@ class ArmPolicyDeployNode(Node):
         if self.episode_stopped:
             return
         self.episode_stopped = True
+        self.episode_stop_reason = reason_type
         self.previous_arm_action = np.zeros(6, dtype=np.float32)
-        self.previous_safety_action.fill(0.0)
-        self.safety_slow_active = False
-        self.rule_safety_retreat_active = False
-        self.rule_safety_retreat_steps = 0
+        if not self.safety_strengthen_active:
+            self.previous_safety_action.fill(0.0)
+            self.safety_slow_active = False
+            self.rule_safety_retreat_active = False
+            self.rule_safety_retreat_steps = 0
         metrics = self.last_fsm_metrics
         mouth_delta = self.mouth_pos - spoon_center if self.mouth_pos is not None else None
         metrics_msg = ""
@@ -2173,7 +2266,7 @@ class ArmPolicyDeployNode(Node):
             f"[episode {reason_type}] {reason}; state={self.fsm_state}, steps={self.policy_step}, "
             f"mouth-spoon={np.round(mouth_delta, 4) if mouth_delta is not None else 'n/a'}{metrics_msg}"
         )
-        if reason_type == "SUCCESS" and self.start_reset_after_success():
+        if reason_type in {"SUCCESS", "SAFETY"} and self.start_reset_after_success():
             # 撤回确认到位后立即归位；绘图延后，避免阻塞轨迹衔接和归位期间的关节记录。
             return
         if not self.args.dry_run and self.current_joint_pos is not None and np.all(np.isfinite(self.current_joint_pos)):
@@ -2182,7 +2275,8 @@ class ArmPolicyDeployNode(Node):
         self.save_joint_angle_curve()
 
     def start_reset_after_success(self) -> bool:
-        if not self.RESET_AFTER_SUCCESS or self.args.dry_run or self.reset_started or not self.success_withdraw_complete:
+        if ((not self.RESET_AFTER_SUCCESS and not self.safety_strengthen_active)
+                or self.args.dry_run or self.reset_started or not self.success_withdraw_complete):
             return False
         if self.current_joint_pos is None or not np.all(np.isfinite(self.current_joint_pos)):
             self.get_logger().error("归位起始关节反馈无效，取消自动归位。")
@@ -2203,7 +2297,7 @@ class ArmPolicyDeployNode(Node):
         self.reset_reached_since_ns = None
         self.fsm_state = "RESET"
         self.publish_joint_target(self.DEFAULT_JOINT_POS, min_duration_s=duration_s)
-        self.get_logger().info(f"成功撤回已确认，已直接下发归位轨迹: duration={duration_s:.2f}s（UR速度缩放前）。")
+        self.get_logger().info(f"撤回已确认，已直接下发归位轨迹: duration={duration_s:.2f}s（UR速度缩放前）。")
         return True
 
     def update_reset_after_success(self) -> None:
@@ -2211,6 +2305,12 @@ class ArmPolicyDeployNode(Node):
         assert self.reset_start_time_ns is not None
         now_ns = self.get_clock().now().nanoseconds
         elapsed_s = (now_ns - self.reset_start_time_ns) * 1e-9
+        if self.safety_strengthen_active:
+            ee_pose = self.lookup_ee_pose(require_fresh=True)
+            if ee_pose is not None:
+                ee_pos, ee_quat = ee_pose
+                spoon_center = ee_pos + quat_apply_wxyz(ee_quat, self.SPOON_OFFSET)
+                self.update_strengthened_safety_state(spoon_center, ee_quat)
         feedback_valid = (
             self.current_joint_pos is not None
             and np.all(np.isfinite(self.current_joint_pos))
@@ -2242,7 +2342,15 @@ class ArmPolicyDeployNode(Node):
         else:
             self.reset_reached_since_ns = None
             return
-        self.save_safety_gain_curve_outputs("SUCCESS")
+        if self.safety_strengthen_active:
+            self.safety_strengthen_active = False
+            self.rule_safety_retreat_active = False
+            safety_state = self.rule_safety_last_state.copy()
+            safety_state.update({"mode": self.fsm_state, "retreat_active": False})
+            if self.safety_grec_force_one:
+                safety_state["retreat_gain"] = 0.0
+            self.publish_safety_state(safety_state)
+        self.save_safety_gain_curve_outputs(self.episode_stop_reason or "SUCCESS")
         self.save_joint_angle_curve()
 
     def lookup_ee_pose(self, require_fresh: bool = False) -> tuple[np.ndarray, np.ndarray] | None:
@@ -2425,7 +2533,7 @@ class ArmPolicyDeployNode(Node):
             f"  safety = mode:{safety_state['mode']}, "
             f"slow:{safety_state['slow_gain']:.3f}, "
             f"center:{safety_state['center_gain']:.3f}, "
-            f"retreat:{safety_state['retreat_gain']:.3f}, "
+            f"grec:{safety_state['grec']:.3f}, "
             f"danger:{safety_state['danger_score']:.3f}, "
             f"radial:{safety_state['spoon_radial']:.4f}, "
             f"depth:{safety_state['mouth_depth']:.4f}, "
@@ -2616,7 +2724,7 @@ class ArmPolicyDeployNode(Node):
 
     def data_is_stale(self) -> bool:
         now_ns = self.get_clock().now().nanoseconds
-        if not self.args.fixed_mouth_pose and self.fsm_state != "SUCCESS_WITHDRAW":
+        if not self.args.fixed_mouth_pose and self.fsm_state not in {"SUCCESS_WITHDRAW", "SAFETY_WITHDRAW"}:
             if self.last_face_time_ns is None or (now_ns - self.last_face_time_ns) * 1.0e-9 > self.args.target_timeout:
                 self.get_logger().warn("视觉目标超时，暂停发布策略动作。", throttle_duration_sec=1.0)
                 return True
