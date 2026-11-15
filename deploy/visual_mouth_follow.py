@@ -14,8 +14,11 @@ from python.utils.ur5e_kinematics import quat_apply_wxyz
 class VisualFollowConfig:
     standoff: float = 0.06
     insert_depth: float = 0.015
+    target_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    horizontal: bool = True
+    locked_feed: bool = True
     track_speed: float = 0.03
-    feed_speed: float = 0.015
+    feed_speed: float = 0.03
     angular_speed: float = 0.15
     command_interval_s: float = 0.10
     open_mm: float = 10.0
@@ -24,7 +27,8 @@ class VisualFollowConfig:
     timeout_s: float = 0.4
     fixed_tolerance: float = 0.015
     align_tolerance: float = 0.008
-    feed_tolerance: float = 0.003
+    height_tolerance: float = 0.003
+    feed_tolerance: float = 0.001
     max_pose_jump: float = 0.05
     max_axis_jump_rad: float = math.radians(30.0)
     max_travel: float = 0.25
@@ -33,15 +37,32 @@ class VisualFollowConfig:
     filter_alpha: float = 0.35
 
     @classmethod
-    def from_args(cls, args):
+    def from_args(cls, args, settings):
         mapping = {
-            "standoff": "follow_standoff", "insert_depth": "follow_insert_depth",
+            "standoff": "follow_standoff", "horizontal": "follow_horizontal",
             "track_speed": "follow_speed", "feed_speed": "follow_feed_speed",
             "open_mm": "mouth_open_mm", "close_mm": "mouth_close_mm",
             "open_hold_s": "mouth_open_hold", "timeout_s": "follow_timeout",
             "fixed_tolerance": "fixed_reach_tolerance",
         }
-        return cls(**{key: getattr(args, value) for key, value in mapping.items()})
+        depth = settings.VISUAL_INSERT_DEPTH_M
+        try:
+            offset = np.asarray(settings.VISUAL_TARGET_OFFSET_M, dtype=np.float64)
+            valid_depth = (math.isfinite(depth)
+                           and settings.VISUAL_INSERT_DEPTH_MIN_M <= depth <= settings.VISUAL_INSERT_DEPTH_MAX_M)
+        except (TypeError, ValueError):
+            raise ValueError('run_task.py 视觉配置必须为数值。') from None
+        if not valid_depth:
+            raise ValueError(
+                f'run_task.py: VISUAL_INSERT_DEPTH_M 必须在 {settings.VISUAL_INSERT_DEPTH_MIN_M:.3f}'
+                f'～{settings.VISUAL_INSERT_DEPTH_MAX_M:.3f}m 内；'
+                '正值在视觉嘴平面内，0 在平面上，负值在平面前；总前送约为等待距离加此值。'
+            )
+        if offset.shape != (3,) or not np.all(np.isfinite(offset)) or np.any(np.abs(offset) > 0.20):
+            raise ValueError('run_task.py: VISUAL_TARGET_OFFSET_M 必须是三个 [-0.20, 0.20]m 内的有限数。')
+        return cls(insert_depth=float(depth), target_offset=tuple(map(float, offset)),
+                   locked_feed=bool(settings.VISUAL_FEED_LOCKED_MODE),
+                   **{key: getattr(args, value) for key, value in mapping.items()})
 
 
 class VisualMouthFollowMixin:
@@ -50,7 +71,7 @@ class VisualMouthFollowMixin:
 
     def init_visual_follow(self, args):
         self.visual_follow_enabled = bool(args.visual_follow_after_fixed)
-        self.visual_follow_config = VisualFollowConfig.from_args(args)
+        self.visual_follow_config = VisualFollowConfig.from_args(args, self)
         self.visual_pose_topic = args.follow_pose_topic
         self.visual_follow_started = False
         self.visual_mouth_pos = None
@@ -74,7 +95,18 @@ class VisualMouthFollowMixin:
         self.visual_aligned_steps = 0
         self.visual_feed_stable_steps = 0
         self.visual_feed_start_ns = None
+        self.visual_feed_trajectory_planned = False
+        self.visual_feed_trajectory_sent = False
+        self.visual_feed_duration_s = 0.0
+        self.visual_feed_timeout_s = 15.0
+        self.visual_feed_interrupted_reason = ''
         self.visual_feed_mouth = None
+        self.visual_feed_locked = False
+        self.visual_feed_insert_depth = None
+        self.visual_feed_start_spoon = None
+        self.visual_feed_observed_mouth = None
+        self.visual_feed_observed_axis = None
+        self.visual_feed_height = None
         self.visual_feed_axis = None
         self.visual_feed_quat = None
         self.visual_anchor = None
@@ -93,6 +125,47 @@ class VisualMouthFollowMixin:
             return False
         age = (self.get_clock().now().nanoseconds - stamp) * 1e-9
         return -0.05 <= age <= self.visual_follow_config.timeout_s
+
+    def visual_control_axis(self, detected_axis):
+        axis = np.asarray(detected_axis, dtype=np.float64).copy()
+        if np.linalg.norm(axis[:2]) < 0.1:
+            raise ValueError('嘴轴接近竖直，无法确定水平喂入方向/本人左右方向')
+        if self.visual_follow_config.horizontal:
+            axis[2] = 0.0
+        return self.normalize_vector(axis)
+
+    def level_spoon_rotation(self, axis):
+        """Point the spoon horizontally, with its bowl normal facing up."""
+        forward = self.visual_control_axis(axis).astype(np.float64)
+        up = np.array([0., 0., 1.])
+        world_basis = np.column_stack([np.cross(up, forward), up, forward])
+        local_forward = self.SPOON_FORWARD_AXIS_LOCAL.astype(np.float64)
+        local_up = self.SPOON_UP_AXIS_LOCAL.astype(np.float64)
+        local_basis = np.column_stack([np.cross(local_up, local_forward), local_up, local_forward])
+        return R.from_matrix(world_basis @ local_basis.T)
+
+    def visual_target_offset_world(self):
+        """Offset the spoon target in entry / person's left / world up axes."""
+        forward = self.visual_mouth_axis.astype(np.float64)
+        up = np.array([0., 0., 1.])
+        person_left = np.cross(forward, up)
+        if np.linalg.norm(person_left) < 0.1:
+            raise ValueError('嘴轴接近竖直，无法确定本人左右补偿方向')
+        person_left /= np.linalg.norm(person_left)
+        return np.column_stack([forward, person_left, up]) @ self.visual_follow_config.target_offset
+
+    def corrected_visual_mouth(self):
+        # Compensation affects only this node's visual control, never /mouth_pose.
+        return self.visual_mouth_pos + self.visual_target_offset_world()
+
+    def visual_feed_target(self):
+        depth = self.visual_feed_insert_depth
+        if depth is None:
+            depth = self.visual_follow_config.insert_depth
+        target = self.visual_feed_mouth + self.visual_feed_axis * depth
+        if self.visual_follow_config.horizontal:
+            target[2] = self.visual_feed_height
+        return target
 
     def visual_pose_callback(self, msg):
         stamp = self.visual_stamp_ns(msg)
@@ -114,6 +187,7 @@ class VisualMouthFollowMixin:
                 self.visual_pose_reject_reason = '位置或四元数无效'
                 return
             axis = -R.from_quat(quat).apply([0., 0., 1.])
+            control_axis = self.visual_control_axis(axis)
         except Exception as exc:
             self.visual_pose_rejected = True
             self.visual_pose_reject_reason = f'位姿转换失败: {exc}'
@@ -133,11 +207,11 @@ class VisualMouthFollowMixin:
         self.visual_pose_reject_reason = ''
         self.visual_pose_accepted_count += 1
         if self.visual_mouth_pos is None:
-            self.visual_mouth_pos, self.visual_mouth_axis = pos.copy(), axis.copy()
+            self.visual_mouth_pos, self.visual_mouth_axis = pos.copy(), control_axis.copy()
         else:
             self.visual_mouth_pos += cfg.filter_alpha * (pos - self.visual_mouth_pos)
             self.visual_mouth_axis = self.normalize_vector(
-                (1. - cfg.filter_alpha) * self.visual_mouth_axis + cfg.filter_alpha * axis
+                (1. - cfg.filter_alpha) * self.visual_mouth_axis + cfg.filter_alpha * control_axis
             )
         self.visual_pose_stamp_ns = stamp
         self.pair_visual_sample()
@@ -214,6 +288,10 @@ class VisualMouthFollowMixin:
 
     def hold_visual_position(self, reason):
         self.get_logger().warn(reason, throttle_duration_sec=1.0)
+        if self.fsm_state in {"VISUAL_FEED", "SUCCESS_HOLD"} and self.visual_feed_trajectory_sent:
+            # A feedback outage cancels feeding. Never resume a trajectory
+            # that was replaced by a hold when data becomes available again.
+            self.visual_feed_interrupted_reason = reason
         self.reset_visual_open_debounce()
         self.visual_feed_stable_steps = 0
         fresh_joint = (
@@ -241,11 +319,125 @@ class VisualMouthFollowMixin:
         self.mouth_quat_wxyz = self.mouth_quat_from_policy_axis(axis)
 
     def abort_visual_feed(self, spoon_center, quat, reason):
-        self.get_logger().warn(f"视觉喂入中止: {reason}，沿锁定方向撤回 10 cm 再归位。")
+        advance = ''
+        if self.visual_feed_start_spoon is not None:
+            actual = float((spoon_center - self.visual_feed_start_spoon) @ self.visual_feed_axis)
+            planned = float((self.visual_feed_target() - self.visual_feed_start_spoon) @ self.visual_feed_axis)
+            advance = f'；实际前送={actual * 1000.:.1f}/{planned * 1000.:.1f}mm'
+        self.get_logger().warn(f"视觉喂入中止: {reason}{advance}，沿锁定方向撤回 10 cm 再归位。")
         self.set_visual_safety_target(self.visual_feed_mouth, self.visual_feed_axis)
         self.start_success_withdraw(spoon_center, quat, safety_triggered=True)
         if not self.episode_stopped:
             self.update_success_withdraw()
+
+    def visual_feed_speed_scale(self, spoon):
+        """Schedule near-lip slowdown before dispatch, without short commands.
+
+        Use the learned filter's maximum possible slow gain at each path point;
+        its live gains cannot request a slower speed than this envelope. The
+        geometric path already converges to the mouth center. Live force,
+        retreat and deviation checks still override the entire trajectory.
+        """
+        offset = spoon - self.visual_feed_mouth
+        depth = float(offset @ self.visual_feed_axis)
+        radial = float(np.linalg.norm(offset - depth * self.visual_feed_axis))
+        if self.learned_safety_enabled:
+            lip_risk = (
+                float(np.clip(1.0 - abs(radial - self.SAFETY_POLICY_MOUTH_HOLE_RADIUS) / self.RULE_LIP_MARGIN, 0., 1.))
+                * float(np.clip(1.0 - abs(depth) / self.SAFETY_POLICY_MOUTH_CHANNEL_FRONT, 0., 1.))
+            )
+            gain = lip_risk if lip_risk > self.RULE_TRIGGER_SCORE else 0.0
+        elif self.rule_safety_enabled:
+            near = self.inverse_ramp(float(np.linalg.norm(offset)), self.RULE_SLOW_START_DIST, self.RULE_SLOW_FULL_DIST)
+            lip = (
+                self.inverse_ramp(abs(radial - self.RULE_MOUTH_CHANNEL_RADIUS), self.RULE_LIP_MARGIN, 0.)
+                * self.inverse_ramp(abs(depth), self.RULE_MOUTH_CHANNEL_FRONT, 0.)
+            )
+            gain = max(near, lip)
+        else:
+            gain = 0.0
+        return 1.0 - float(np.clip(gain, 0., 0.95))
+
+    def update_visual_feed_trajectory(self, ee_pos, quat, spoon, target):
+        """Dispatch one complete feed and monitor actual arrival, never resend."""
+        cfg = self.visual_follow_config
+        offset = spoon - self.visual_feed_mouth
+        depth = float(offset @ self.visual_feed_axis)
+        radial = float(np.linalg.norm(offset - depth * self.visual_feed_axis))
+        rotation_error = (R.from_quat(self.visual_feed_quat[[1, 2, 3, 0]])
+                          * R.from_quat(quat[[1, 2, 3, 0]]).inv()).magnitude()
+        if cfg.horizontal and abs(spoon[2] - self.visual_feed_height) > cfg.height_tolerance:
+            self.abort_visual_feed(spoon, quat, '实际喂入高度偏离锁定高度超过 3mm')
+            return
+        if (radial > cfg.align_tolerance + cfg.feed_tolerance
+                or rotation_error > math.radians(5.) or depth > self.visual_feed_insert_depth + cfg.feed_tolerance):
+            self.abort_visual_feed(spoon, quat, "实际喂入偏离锁定通道/姿态或深度超限")
+            return
+        error = float(np.linalg.norm(target - spoon))
+        settled = np.max(np.abs(self.current_joint_vel)) < 0.03
+        advanced = float((spoon - self.visual_feed_start_spoon) @ self.visual_feed_axis)
+        planned = float((target - self.visual_feed_start_spoon) @ self.visual_feed_axis)
+        self.get_logger().info(
+            f'连续喂入: depth={depth * 1000.:.1f}/{self.visual_feed_insert_depth * 1000.:.1f}mm '
+            f'（相对嘴平面）, advance={advanced * 1000.:.1f}/{planned * 1000.:.1f}mm, '
+            f'target_offset={np.round(np.asarray(cfg.target_offset) * 1000., 1)}mm, '
+            f'vision_depth={float((spoon - self.visual_feed_observed_mouth) @ self.visual_feed_axis) * 1000.:.1f}mm, '
+            f'remaining={error * 1000.:.1f}mm, radial={radial * 1000.:.1f}mm, '
+            f'height={spoon[2]:.4f}m, '
+            f'trajectory_sent={self.visual_feed_trajectory_sent}, speed_scaling_raw={self.speed_scaling}',
+            throttle_duration_sec=0.5,
+        )
+        if self.visual_feed_trajectory_sent and error <= cfg.feed_tolerance and settled:
+            self.visual_feed_stable_steps += 1
+            if self.visual_feed_stable_steps >= 5:
+                self.get_logger().warn(f'视觉喂入实际到位: depth={depth * 1000.:.1f}mm，开始保持。')
+                self.start_success_hold()
+            return
+        self.visual_feed_stable_steps = 0
+        if self.visual_feed_trajectory_planned:
+            return
+        try:
+            trajectory = self.plan_spoon_linear_trajectory(
+                ee_pos, quat, target, self.visual_feed_quat, cfg.feed_speed,
+                max_lateral_error=cfg.feed_tolerance,
+                max_orientation_error=math.radians(2.),
+                speed_scale_at_spoon=self.visual_feed_speed_scale,
+            )
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            self.abort_visual_feed(spoon, quat, f'连续喂入轨迹规划失败: {exc}')
+            return
+        self.visual_feed_trajectory_planned = True
+        end_time = trajectory.points[-1].time_from_start
+        self.visual_feed_duration_s = end_time.sec + end_time.nanosec * 1e-9
+        scaling = float(self.speed_scaling) if self.speed_scaling is not None else 1.0
+        if scaling > 1.0:
+            scaling /= 100.0
+        expected_s = self.visual_feed_duration_s / max(scaling, 0.01)
+        hold_s = self.SUCCESS_HOLD_STEPS_AFTER_REACHED * self.control_period
+        self.visual_feed_timeout_s = max(15.0, expected_s * 2.0 + hold_s + 3.0)
+        self.visual_feed_start_ns = self.get_clock().now().nanoseconds
+        # Robot feedback is always required; locked feeding already captured
+        # valid vision at alignment and does not depend on camera visibility.
+        if self.data_is_stale() or (not self.args.dry_run and not self.ros_control_is_ready()):
+            self.abort_visual_feed(spoon, quat, '规划后机器人反馈/控制器失效')
+            return
+        if not self.visual_feed_locked and (
+                self.visual_pose_rejected or not self.visual_stamp_fresh(self.visual_pose_stamp_ns)
+                or not self.visual_opening_ready()):
+            self.abort_visual_feed(spoon, quat, '规划后视觉数据失效')
+            return
+        if not self.args.dry_run:
+            self.pub.publish(trajectory)
+            self.visual_feed_trajectory_sent = True
+        self.get_logger().warn(
+            f'{"预览" if self.args.dry_run else "已一次下发"}完整连续喂入轨迹: '
+            f'travel={np.linalg.norm(target - spoon) * 1000.:.1f}mm, depth={self.visual_feed_insert_depth * 1000.:.1f}mm, '
+            f'locked_feed={self.visual_feed_locked}, '
+            f'duration={self.visual_feed_duration_s:.2f}s（UR速度缩放前，含近嘴减速）, '
+            f'expected={expected_s:.2f}s, timeout={self.visual_feed_timeout_s:.2f}s；途中不重发。'
+            f' axis_base={np.round(self.visual_feed_axis, 4)}, '
+            f'start_spoon_base={np.round(self.visual_feed_start_spoon, 4)}, target_spoon_base={np.round(target, 4)}'
+        )
 
     def step_visual_follow(self):
         if self.data_is_stale() or (not self.args.dry_run and not self.ros_control_is_ready()):
@@ -271,20 +463,33 @@ class VisualMouthFollowMixin:
             else:
                 self.stop_episode("TIMEOUT", "视觉跟随等待超时", spoon)
             return
-        if self.visual_pose_rejected or not self.visual_stamp_fresh(self.visual_pose_stamp_ns):
+        if not (feeding and self.visual_feed_locked) and (
+                self.visual_pose_rejected or not self.visual_stamp_fresh(self.visual_pose_stamp_ns)):
             if feeding:
                 self.abort_visual_feed(spoon, quat, "视觉目标丢失、跳变或过期")
             else:
                 self.hold_visual_position("等待新鲜视觉嘴部位姿: " + self.visual_wait_status())
             return
         if feeding:
-            moved = np.linalg.norm(self.visual_raw_pos - self.visual_feed_mouth) > cfg.feed_motion_tolerance
-            angle = math.acos(float(np.clip(np.dot(self.visual_raw_axis, self.visual_feed_axis), -1., 1.)))
-            if (not self.visual_opening_ready() or self.visual_gap_mm <= cfg.close_mm
-                    or moved or angle > cfg.feed_axis_tolerance_rad):
-                self.abort_visual_feed(spoon, quat, "嘴闭合、开口数据失效或头部移动超限")
+            if self.visual_feed_interrupted_reason:
+                self.abort_visual_feed(spoon, quat, "机器人反馈曾中断: " + self.visual_feed_interrupted_reason)
                 return
-            if (now - self.visual_feed_start_ns) * 1e-9 > 15.:
+            if not self.visual_feed_locked:
+                movement = float(np.linalg.norm(self.visual_raw_pos - self.visual_feed_observed_mouth))
+                angle = math.acos(float(np.clip(np.dot(self.visual_raw_axis, self.visual_feed_observed_axis), -1., 1.)))
+                if not self.visual_opening_ready():
+                    self.abort_visual_feed(spoon, quat, '同帧开口数据失效/过期')
+                    return
+                if self.visual_gap_mm <= cfg.close_mm:
+                    self.abort_visual_feed(spoon, quat, f'嘴闭合: opening={self.visual_gap_mm:.1f}mm <= {cfg.close_mm:.1f}mm')
+                    return
+                if movement > cfg.feed_motion_tolerance or angle > cfg.feed_axis_tolerance_rad:
+                    delta = self.visual_raw_pos - self.visual_feed_observed_mouth
+                    self.abort_visual_feed(spoon, quat,
+                        f'头部移动超限: shift={movement * 1000.:.1f}mm, angle={math.degrees(angle):.1f}deg, '
+                        f'delta_base={np.round(delta * 1000., 1)}mm；喂入轨迹尚未完成不能视为深度不足')
+                    return
+            if (now - self.visual_feed_start_ns) * 1e-9 > self.visual_feed_timeout_s:
                 self.abort_visual_feed(spoon, quat, "喂入超时")
                 return
             raw_wrench = self.get_sim_aligned_safety_wrench_raw()
@@ -294,24 +499,28 @@ class VisualMouthFollowMixin:
                     or axial > self.RULE_AXIAL_FORCE_THRESHOLD_N):
                 self.abort_visual_feed(spoon, quat, "喂入期间力/力矩超限")
                 return
-            target = self.visual_feed_mouth + self.visual_feed_axis * cfg.insert_depth
+            target = self.visual_feed_target()
             goal_rot = R.from_quat(self.visual_feed_quat[[1, 2, 3, 0]])
         else:
-            if np.linalg.norm(self.visual_raw_pos - self.visual_anchor) > cfg.max_travel:
+            if max(np.linalg.norm(self.visual_raw_pos - self.visual_anchor),
+                   np.linalg.norm(self.corrected_visual_mouth() - self.visual_anchor)) > cfg.max_travel:
                 self.hold_visual_position("视觉目标超出固定点附近 25 cm 的跟随范围。")
                 return
-            self.set_visual_safety_target(self.visual_mouth_pos, self.visual_mouth_axis)
+            self.set_visual_safety_target(self.corrected_visual_mouth(), self.visual_mouth_axis)
             target = self.mouth_pos - self.compute_mouth_axis() * cfg.standoff
             current_rot = R.from_quat(quat[[1, 2, 3, 0]])
-            current_axis = current_rot.apply(self.SPOON_FORWARD_AXIS_LOCAL)
             desired_axis = self.compute_mouth_axis()
-            cross = np.cross(current_axis, desired_axis)
-            dot = float(np.clip(np.dot(current_axis, desired_axis), -1., 1.))
-            if np.linalg.norm(cross) < 1e-8 and dot < 0.:
-                self.hold_visual_position("勺子与嘴轴反向，暂停跟随并检查姿态。")
-                return
-            correction = cross / max(float(np.linalg.norm(cross)), 1e-8) * math.acos(dot)
-            goal_rot = R.from_rotvec(correction) * current_rot
+            if cfg.horizontal:
+                goal_rot = self.level_spoon_rotation(desired_axis)
+            else:
+                current_axis = current_rot.apply(self.SPOON_FORWARD_AXIS_LOCAL)
+                cross = np.cross(current_axis, desired_axis)
+                dot = float(np.clip(np.dot(current_axis, desired_axis), -1., 1.))
+                if np.linalg.norm(cross) < 1e-8 and dot < 0.:
+                    self.hold_visual_position("勺子与嘴轴反向，暂停跟随并检查姿态。")
+                    return
+                correction = cross / max(float(np.linalg.norm(cross)), 1e-8) * math.acos(dot)
+                goal_rot = R.from_rotvec(correction) * current_rot
         if not np.all(np.isfinite(target)) or np.any(target < self.WORKSPACE_MIN) or np.any(target > self.WORKSPACE_MAX):
             if feeding:
                 self.abort_visual_feed(spoon, quat, "喂入目标越界")
@@ -327,17 +536,40 @@ class VisualMouthFollowMixin:
         settled = np.max(np.abs(self.current_joint_vel)) < 0.03
         if not feeding:
             stable_open = self.update_visual_open_debounce()
-            aligned = error <= cfg.align_tolerance and np.linalg.norm(rotation_error) <= math.radians(5.) and settled
+            angle_tolerance = math.radians(1. if cfg.horizontal else 5.)
+            height_aligned = not cfg.horizontal or abs(target[2] - spoon[2]) <= cfg.height_tolerance
+            aligned = error <= cfg.align_tolerance and height_aligned and np.linalg.norm(rotation_error) <= angle_tolerance and settled
             self.visual_aligned_steps = self.visual_aligned_steps + 1 if aligned else 0
             if stable_open and self.visual_aligned_steps >= 5:
                 self.fsm_state = "VISUAL_FEED"
-                self.visual_feed_mouth = self.visual_mouth_pos.copy()
+                self.visual_feed_mouth = self.corrected_visual_mouth().copy()
+                self.visual_feed_start_spoon = spoon.copy()
+                self.visual_feed_observed_mouth = self.visual_raw_pos.copy()
+                self.visual_feed_observed_axis = self.visual_raw_axis.copy()
                 self.visual_feed_axis = self.visual_mouth_axis.copy()
-                self.visual_feed_quat = quat.copy()
+                self.visual_feed_locked = bool(cfg.locked_feed)
+                self.visual_feed_insert_depth = float(cfg.insert_depth)
+                self.visual_feed_height = float(spoon[2])
+                self.visual_feed_quat = goal_rot.as_quat()[[3, 0, 1, 2]] if cfg.horizontal else quat.copy()
                 self.visual_feed_start_ns = now
                 self.visual_feed_stable_steps = 0
+                self.visual_feed_trajectory_planned = False
+                self.visual_feed_trajectory_sent = False
+                self.visual_feed_interrupted_reason = ''
                 self.set_visual_safety_target(self.visual_feed_mouth, self.visual_feed_axis)
-                self.get_logger().warn(f"持续张嘴并已对准，锁定嘴轴，喂入 {cfg.insert_depth:.3f}m。")
+                self.get_logger().warn(
+                    f"持续张嘴并已对准，horizontal={cfg.horizontal}, "
+                    f"喂入锁定高度={self.visual_feed_height:.4f}m，"
+                    f"末端目标补偿[前,本人左,上]={np.round(np.asarray(cfg.target_offset) * 1000., 1)}mm，"
+                    f"勺心目标相对补偿后嘴平面={cfg.insert_depth * 1000.:+.1f}mm（正内/负外）；"
+                    f"locked_feed={self.visual_feed_locked}；"
+                    "将一次下发连续喂入轨迹。"
+                )
+                if self.visual_feed_locked:
+                    self.get_logger().info(
+                        "本次喂入目标已锁定；后续视觉开口/位姿仅接收，不改变目标或触发中止，"
+                        "到位并保持后沿锁定方向撤回归位；力觉、机器人反馈和轨迹保护继续生效。"
+                    )
                 return
         elif not (error <= cfg.feed_tolerance and settled):
             self.visual_feed_stable_steps = 0
@@ -362,17 +594,12 @@ class VisualMouthFollowMixin:
             if self.fsm_state == "SUCCESS_HOLD":
                 self.update_success_hold(spoon, quat)
                 return
-            if error <= cfg.feed_tolerance and settled:
-                self.visual_feed_stable_steps += 1
-                if self.visual_feed_stable_steps >= 5:
-                    self.start_success_hold()
-                return
+            self.record_wrench_sample(spoon, np.zeros(6), np.zeros(6), np.zeros(6), delta, state, delta)
+            self.update_visual_feed_trajectory(ee_pos, quat, spoon, target)
+            return
         safe, reason = self.delta_safety_status(ee_pos, quat, delta)
         if not safe:
-            if feeding:
-                self.abort_visual_feed(spoon, quat, reason)
-            else:
-                self.hold_visual_position(f"视觉动作被工作空间限制阻止: {reason}")
+            self.hold_visual_position(f"视觉动作被工作空间限制阻止: {reason}")
             return
         joint_target = self.ik.joint_target_from_delta(
             self.current_joint_pos, self.ros_delta_to_ik_delta(delta), self.args.max_joint_step
@@ -382,6 +609,9 @@ class VisualMouthFollowMixin:
             return
         self.get_logger().info(
             f"视觉阶段={self.fsm_state}, target_error={error:.4f}m, "
+            f"angle_error={math.degrees(np.linalg.norm(rotation_error)):.1f}deg, "
+            f"pitch={self.last_fsm_metrics['handle_tilt_deg']:.1f}deg, "
+            f"bowl_tilt={self.last_fsm_metrics['bowl_tilt_deg']:.1f}deg, "
             f"opening={self.visual_gap_mm}, dry_run={self.args.dry_run}", throttle_duration_sec=0.5,
         )
         self.record_wrench_sample(spoon, np.zeros(6), np.zeros(6), np.zeros(6), delta, state, delta)

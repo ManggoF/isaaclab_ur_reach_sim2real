@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from deploy.run_task import ArmPolicyDeployNode
+from deploy.visual_mouth_follow import VisualFollowConfig
 from deploy.tests.test_success_withdraw import OfflineDeployNode, TimedTrajectoryDeployNode
 
 
@@ -40,6 +41,49 @@ def configure_tracking(node, backend="learned", hazard=True, force_one=True):
 
 
 class SafetyStrengthenTest(unittest.TestCase):
+    def test_visual_mode_suppresses_retreat_motion_and_clears_both_backend_latches(self):
+        for backend in ("learned", "rule"):
+            for force_one in (False, True):
+                with self.subTest(backend=backend, force_one=force_one):
+                    node = OfflineDeployNode()
+                    configure_tracking(node, backend, force_one=force_one)
+                    node.visual_follow_enabled = True
+                    node.rule_safety_retreat_active = True
+                    node.rule_safety_retreat_steps = 10
+                    spoon, quat = node.spoon_pose()
+                    ee_pos, _ = node.lookup_ee_pose()
+                    requested = np.r_[node.mouth_axis * 0.002, [0.001, 0.002, 0.003]]
+                    apply_filter = (node.apply_learned_safety_filter if backend == "learned"
+                                    else node.apply_rule_based_safety_filter)
+                    actual, state = apply_filter(ee_pos, quat, spoon, requested)
+                    self.assertGreater(state["force_risk"], 0., "Retain risk diagnostics")
+                    self.assertEqual(state["retreat_gain"], 0.)
+                    self.assertEqual(state["grec"], 0.)
+                    self.assertFalse(node.rule_safety_retreat_active)
+                    self.assertEqual(node.rule_safety_retreat_steps, 0)
+                    self.assertGreaterEqual(float(actual[:3] @ node.mouth_axis), -1e-8)
+                    np.testing.assert_allclose(actual[3:], requested[3:])
+                    self.assertFalse(node.maybe_start_safety_strengthen(spoon, quat, {"retreat_gain": 1.}))
+                    self.assertFalse(node.safety_strengthen_active)
+                    self.assertEqual(node.safety_gain_curve_rows[-1]["grec"], 0.)
+
+    def test_visual_mode_disables_grec_before_fixed_point_handoff(self):
+        for backend in ("learned", "rule"):
+            with self.subTest(backend=backend):
+                node = OfflineDeployNode()
+                configure_tracking(node, backend)
+                node.visual_follow_enabled = True
+                node.visual_follow_config = VisualFollowConfig()
+                node.tick()
+                node.policy.act.assert_called_once()
+                self.assertEqual(node.fsm_state, "APPROACH")
+                self.assertFalse(node.visual_follow_started)
+                self.assertFalse(node.safety_strengthen_active)
+                self.assertEqual(node.rule_safety_last_state["retreat_gain"], 0.)
+                self.assertTrue(all(row["grec"] == 0. for row in node.safety_gain_curve_rows))
+                self.assertEqual(node.trajectories, [])
+                self.assertEqual(len(node.commands), 1)
+
     def test_both_safety_backends_immediately_send_one_ten_cm_trajectory(self):
         for backend in ("learned", "rule"):
             with self.subTest(backend=backend):

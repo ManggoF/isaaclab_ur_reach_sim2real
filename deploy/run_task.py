@@ -36,7 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from python.controllers.harl_arm_policy import HarlArmPolicy
 from python.utils.joint_angle_recorder import JointAngleRecorder
 from python.utils.ur5e_kinematics import UR5eDLSIK, quat_apply_wxyz, quat_xyzw_to_wxyz
-from deploy.visual_mouth_follow import VisualMouthFollowMixin
+from deploy.visual_mouth_follow import VisualFollowConfig, VisualMouthFollowMixin
 
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "sample/actor_agent_arm_torchscript.pt"
@@ -102,6 +102,14 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     FEED_INSERT_RADIUS_M = 0.04
     FEED_INSERT_DEPTH_MIN_M = 0.008
     FEED_INSERT_DEPTH_MAX_M = 0.080
+    # 固定点后的视觉控制调参，单位 m；修改后重新运行，无需附加命令行参数。
+    VISUAL_INSERT_DEPTH_M = -0.005  # 嘴平面前 5 mm；比 +0.005 少前送 1 cm，仅改变喂入终点。
+    VISUAL_INSERT_DEPTH_MIN_M = -0.020  # 允许终点位于视觉嘴平面前最多 2 cm，便于缩短前送。
+    VISUAL_INSERT_DEPTH_MAX_M = 0.080  # 最大 8 cm，配合至少 10 cm 撤回，退出嘴平面后再归位。
+    VISUAL_FEED_LOCKED_MODE = True  # 张嘴对准后锁定喂入，忽略后续视觉遮挡/闭嘴/头部位移；保留力觉和机器人反馈保护。
+    # [向嘴内/向前, 向本人左侧, 向上]；负值分别为向外、本人右侧、向下。
+    # 保持全零；深度不足只修改 VISUAL_INSERT_DEPTH_M，不移动视觉跟随等待位置。
+    VISUAL_TARGET_OFFSET_M = (0.00, 0.00, 0.00)
     FEED_INSERT_ALIGN_DOT_MIN = 0.8
     FEED_STABLE_STEPS_REQUIRED = 5
     SUCCESS_HOLD_STEPS_AFTER_REACHED = 30
@@ -140,7 +148,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     # 规则安全层配置集中写在代码里，实机调参时直接改这里，避免部署命令行越来越长。
     # 开关与可视化: 控制规则层是否接管动作，以及是否显示/保存三通道增益图像。
     RULE_SAFETY_ENABLED = False
-    safety_strenthen = True  # True: 有效 grec > 0 后锁定撤回 10 cm 再归位；False: 保持原安全策略。
+    safety_strenthen = True  # True: grec > 0 后撤回 10 cm 再归位；False: 保持原逐步干预；视觉模式强制 grec=0。
     safety_grec_force_one = False  # 加强模式记录：True 固定 grec=1；False 记录原安全策略增益。
     SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M = 0.10
     SAFETY_GAIN_VISUALIZATION = True
@@ -186,7 +194,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     SAFETY_POLICY_MOUTH_CHANNEL_RADIUS = SAFETY_POLICY_MOUTH_HOLE_RADIUS * 1.25
     SAFETY_POLICY_MOUTH_CHANNEL_FRONT = 0.050
     SAFETY_POLICY_MOUTH_CHANNEL_BACK = 0.030
-    SAFETY_POLICY_LINK_THRESHOLD = 0.005
+    SAFETY_POLICY_LINK_THRESHOLD = 0.003  # 勺心距嘴部特征点小于 3 mm 时触发接触判定；增大会更早撤回。
     SAFETY_POLICY_FORCE_SOFT_LIMIT = 0.80
     SAFETY_POLICY_TORQUE_SOFT_LIMIT = 0.80
     SAFETY_POLICY_AX_FORCE_LIMIT = 0.50
@@ -367,16 +375,30 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         if self.visual_follow_enabled:
             self.get_logger().info(
                 f"固定点后视觉跟随已启用: standoff={args.follow_standoff:.3f}m, "
-                f"insert={args.follow_insert_depth:.3f}m, "
+                f"insert={self.visual_follow_config.insert_depth:.3f}m, "
+                f"nominal_feed_travel={args.follow_standoff + self.visual_follow_config.insert_depth:.3f}m, "
+                f"target_offset[forward,person_left,up]={self.visual_follow_config.target_offset}m, "
+                f"horizontal={args.follow_horizontal}, "
+                f"locked_feed={self.visual_follow_config.locked_feed}, "
                 f"opening={args.mouth_open_mm:.1f}mm/{args.mouth_open_hold:.2f}s；"
                 f"融合目标={args.follow_pose_topic}，开口={args.follow_opening_topic}。"
             )
-        self.get_logger().info(
-            f"safety_strenthen={self.safety_strenthen}: "
-            "开启时有效 grec > 0 即锁定撤回 10 cm 再归位；"
-            f"safety_grec_force_one={self.safety_grec_force_one} "
-            f"（grec记录模式: {'固定为1' if self.safety_grec_force_one else '原安全策略输出'}）。"
-        )
+            self.get_logger().info(
+                "视觉跟随模式：从固定点接近阶段起，有效/记录 grec 始终为 0，禁用原安全层撤回及安全加强触发；"
+                "保留减速/居中、正常成功撤回，以及力/力矩、机器人反馈和实际轨迹保护。"
+            )
+            if self.visual_follow_config.locked_feed:
+                self.get_logger().info(
+                    "喂入锁定模式：张嘴和对准检查只在开始前进行；喂入及成功保持期间使用锁定目标，"
+                    "后续相机遮挡、开口变化和视觉头部位移不打断轨迹。"
+                )
+        else:
+            self.get_logger().info(
+                f"safety_strenthen={self.safety_strenthen}: "
+                "开启时有效 grec > 0 即锁定撤回 10 cm 再归位；"
+                f"safety_grec_force_one={self.safety_grec_force_one} "
+                f"（grec记录模式: {'固定为1' if self.safety_grec_force_one else '原安全策略输出'}）。"
+            )
         self.get_logger().info(f"policy request: {Path(args.model_path).expanduser().resolve()}")
         self.get_logger().info(f"policy loaded: {self.policy.loaded_path}")
         self.get_logger().info(f"policy backend: {self.policy.backend}")
@@ -1042,7 +1064,10 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         safety_lateral_gain = float(safety_gain[2])
 
         hazard_now = self.learned_safety_hazard_now(safety_state)
-        if hazard_now:
+        if self.visual_follow_enabled:
+            # 整个视觉模式（包括 APPROACH）均禁用 grec，不能只修改显示值。
+            self.rule_safety_retreat_active = False
+        elif hazard_now:
             self.rule_safety_retreat_active = True
         elif self.rule_safety_retreat_active:
             retreat_clear = float(safety_state["safe_clearance_norm"]) > float(self.SAFETY_POLICY_RESET_CLEARANCE)
@@ -1253,7 +1278,9 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         )
         hazard_now = danger_score >= float(self.RULE_TRIGGER_SCORE) or geometry_danger
         safe_clearance = max(float(np.dot(rel_spoon, retract_dir_w)), 0.0)
-        if hazard_now:
+        if self.visual_follow_enabled:
+            self.rule_safety_retreat_active = False
+        elif hazard_now:
             self.rule_safety_retreat_active = True
         elif self.rule_safety_retreat_active:
             clear_enough = safe_clearance > float(self.RULE_RETREAT_RELEASE_DIST)
@@ -1331,8 +1358,9 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         return arm_delta, safety_state
 
     def publish_safety_state(self, safety_state: dict[str, object]) -> None:
-        """记录值与触发值分开，切换 grec 记录模式不会改变撤回/归位控制。"""
-        original_gain = float(safety_state["retreat_gain"])
+        """视觉模式统一禁用 grec；其余模式的记录开关只改变记录值。"""
+        original_gain = 0.0 if self.visual_follow_enabled else float(safety_state["retreat_gain"])
+        safety_state["retreat_gain"] = original_gain
         safety_state["grec"] = original_gain
         pending_strengthen = self.safety_strenthen and not self.episode_stopped and original_gain > 0.0
         if self.safety_strengthen_active or pending_strengthen:
@@ -1340,7 +1368,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
             safety_state.update({
                 "mode": "SAFETY_RESET" if self.reset_started else "SAFETY_WITHDRAW",
                 "slow_gain": 0.0, "center_gain": 0.0,
-                "grec": 1.0 if self.safety_grec_force_one else original_gain,
+                "grec": 1.0 if self.safety_grec_force_one and not self.visual_follow_enabled else original_gain,
                 "retreat_active": True,
             })
         self.rule_safety_last_state = safety_state
@@ -1351,7 +1379,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray, safety_state: dict[str, object]
     ) -> bool:
         """有效 grec 首次触发后接管整条轨迹，当前策略动作不再下发。"""
-        if not self.safety_strenthen or float(safety_state["retreat_gain"]) <= 0.0:
+        if self.visual_follow_enabled or not self.safety_strenthen or float(safety_state["retreat_gain"]) <= 0.0:
             return False
         if self.safety_strengthen_active:
             return True
@@ -2132,22 +2160,38 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         )
 
     def plan_success_withdraw_trajectory(self, ee_pos: np.ndarray, ee_quat_wxyz: np.ndarray) -> JointTrajectory:
-        """预先求解整条直线路径，生成平滑起停、途中不停顿的单条轨迹。"""
-        assert self.current_joint_pos is not None
         assert self.success_withdraw_start_spoon is not None
         assert self.success_withdraw_direction is not None
         assert self.success_withdraw_quat_wxyz is not None
+        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.withdraw_distance_m
+        return self.plan_spoon_linear_trajectory(
+            ee_pos, ee_quat_wxyz, goal_spoon, self.success_withdraw_quat_wxyz,
+            self.SUCCESS_WITHDRAW_SPEED_M_S,
+            max_lateral_error=self.SUCCESS_WITHDRAW_MAX_LATERAL_ERROR_M,
+            max_orientation_error=self.SUCCESS_WITHDRAW_MAX_ORIENTATION_ERROR_RAD,
+        )
+
+    def plan_spoon_linear_trajectory(
+        self, ee_pos: np.ndarray, ee_quat_wxyz: np.ndarray,
+        goal_spoon: np.ndarray, goal_quat_wxyz: np.ndarray, speed_m_s: float,
+        *, max_lateral_error: float, max_orientation_error: float, speed_scale_at_spoon=None,
+    ) -> JointTrajectory:
+        """预先求解勺心直线路径，只在两端起停；供喂入和撤回共用。"""
+        assert self.current_joint_pos is not None
+        if not np.isfinite(speed_m_s) or speed_m_s <= 0.0:
+            raise ValueError("直线运动速度必须为有限正数")
         initial_rot = R.from_quat(ee_quat_wxyz[[1, 2, 3, 0]])
-        goal_rot = R.from_quat(self.success_withdraw_quat_wxyz[[1, 2, 3, 0]])
+        goal_rot = R.from_quat(goal_quat_wxyz[[1, 2, 3, 0]])
         rotation_delta = (goal_rot * initial_rot.inv()).as_rotvec()
         initial_spoon = ee_pos + initial_rot.apply(self.SPOON_OFFSET)
-        goal_spoon = self.success_withdraw_start_spoon + self.success_withdraw_direction * self.withdraw_distance_m
         distance = float(np.linalg.norm(goal_spoon - initial_spoon))
+        direction = (goal_spoon - initial_spoon) / max(distance, 1e-9)
         resolution = min(self.SUCCESS_WITHDRAW_PATH_RESOLUTION_M, self.args.max_cartesian_step / 1.5)
         if not np.isfinite(resolution) or resolution <= 0.0:
-            raise ValueError("撤回路径采样间距必须大于零")
+            raise ValueError("直线路径采样间距必须大于零")
         sample_count = max(20, int(math.ceil(distance / resolution)))
         joint_path = [self.current_joint_pos.astype(np.float64).copy()]
+        speed_scales = [1.0 if speed_scale_at_spoon is None else speed_scale_at_spoon(initial_spoon)]
         initial_model_pos, initial_model_rot = self.ik.fk(joint_path[0])
         ros_to_ik = R.from_rotvec([0.0, 0.0, math.pi])
         previous_ee, previous_rot = ee_pos, initial_rot
@@ -2178,34 +2222,39 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
                 if not np.all(np.isfinite(joint_target)):
                     raise ValueError("IK 关节目标无效")
             else:
-                raise ValueError("直线撤回 IK 未收敛")
+                raise ValueError("直线路径 IK 未收敛")
             if np.max(np.abs(joint_target - joint_path[-1])) > self.args.max_joint_step + self.SAFETY_EPS:
-                raise ValueError("撤回路径相邻采样点关节变化过大")
+                raise ValueError("直线路径相邻采样点关节变化过大")
             joint_path.append(joint_target)
+            speed_scales.append(1.0 if speed_scale_at_spoon is None else speed_scale_at_spoon(target_spoon))
             previous_ee, previous_rot = target_ee, target_rot
 
         positions = np.asarray(joint_path)
-        derivatives = np.gradient(positions, axis=0)
-        derivatives[[0, -1]] = 0.0
+        speed_scales = np.asarray(speed_scales, dtype=np.float64)
+        if not np.all(np.isfinite(speed_scales)) or np.any(speed_scales <= 0.0) or np.any(speed_scales > 1.0):
+            raise ValueError("路径速度比例必须在 (0, 1] 内")
+        base_interval_s = max(self.args.min_trajectory_duration, distance / speed_m_s) / sample_count
+        intervals = base_interval_s / np.minimum(speed_scales[:-1], speed_scales[1:])
+        times = np.concatenate([[0.0], np.cumsum(intervals)])
+        velocities = np.gradient(positions, times, axis=0)
+        velocities[[0, -1]] = 0.0
         # 三次 Hermite 插值的速度是二次 Bezier 曲线；用其控制点上界
         # 计算整段时长，保证采样点之间也满足每个关节的速度限制。
         velocity_bounds = np.maximum.reduce([
-            np.abs(derivatives[:-1]), np.abs(derivatives[1:]),
-            np.abs(3.0 * np.diff(positions, axis=0) - derivatives[:-1] - derivatives[1:]),
+            np.abs(velocities[:-1]), np.abs(velocities[1:]),
+            np.abs(3.0 * np.diff(positions, axis=0) / intervals[:, None] - velocities[:-1] - velocities[1:]),
         ])
-        duration_s = max(
-            self.args.min_trajectory_duration,
-            distance / self.SUCCESS_WITHDRAW_SPEED_M_S,
-            sample_count * float(np.max(velocity_bounds / self.JOINT_MAX_VELOCITIES_RAD_S)),
-        )
-        interval_s = duration_s / sample_count
+        time_scale = max(1.0, float(np.max(velocity_bounds / self.JOINT_MAX_VELOCITIES_RAD_S)))
+        times *= time_scale
+        intervals *= time_scale
+        velocities /= time_scale
         trajectory = JointTrajectory()
         trajectory.joint_names = list(self.JOINT_NAMES)
-        for index, (position, derivative) in enumerate(zip(positions, derivatives)):
+        for position, velocity, time_s in zip(positions, velocities, times):
             point = JointTrajectoryPoint()
             point.positions = position.tolist()
-            point.velocities = (derivative / interval_s).tolist()
-            time_ns = round(index * interval_s * 1e9)
+            point.velocities = velocity.tolist()
+            time_ns = round(time_s * 1e9)
             point.time_from_start = Duration(sec=time_ns // 1_000_000_000, nanosec=time_ns % 1_000_000_000)
             trajectory.points.append(point)
 
@@ -2216,23 +2265,24 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
                 h10 = fraction**3 - 2.0 * fraction**2 + fraction
                 h01 = -2.0 * fraction**3 + 3.0 * fraction**2
                 h11 = fraction**3 - fraction**2
-                joints = (h00 * positions[index] + h10 * derivatives[index]
-                          + h01 * positions[index + 1] + h11 * derivatives[index + 1])
+                joints = (h00 * positions[index] + h10 * intervals[index] * velocities[index]
+                          + h01 * positions[index + 1] + h11 * intervals[index] * velocities[index + 1])
                 model_pos, model_rot = self.ik.fk(joints)
                 predicted_ee = ee_pos + ros_to_ik.inv().apply(model_pos - initial_model_pos)
                 predicted_rot = ros_to_ik.inv() * model_rot * initial_model_rot.inv() * ros_to_ik * initial_rot
                 predicted_spoon = predicted_ee + predicted_rot.apply(self.SPOON_OFFSET)
-                displacement = predicted_spoon - self.success_withdraw_start_spoon
-                progress = float(displacement @ self.success_withdraw_direction)
-                lateral = np.linalg.norm(displacement - progress * self.success_withdraw_direction)
+                displacement = predicted_spoon - initial_spoon
+                progress = float(displacement @ direction)
+                lateral = np.linalg.norm(displacement - progress * direction)
                 if not (
                     np.all(joints >= self.ik.lower_limits) and np.all(joints <= self.ik.upper_limits)
                     and np.all(predicted_ee >= self.WORKSPACE_MIN) and np.all(predicted_ee <= self.WORKSPACE_MAX)
                     and np.all(predicted_spoon >= self.WORKSPACE_MIN) and np.all(predicted_spoon <= self.WORKSPACE_MAX)
-                    and lateral <= self.SUCCESS_WITHDRAW_MAX_LATERAL_ERROR_M
-                    and (goal_rot * predicted_rot.inv()).magnitude() <= self.SUCCESS_WITHDRAW_MAX_ORIENTATION_ERROR_RAD
+                    and -0.001 <= progress <= distance + 0.001
+                    and lateral <= max_lateral_error
+                    and (goal_rot * predicted_rot.inv()).magnitude() <= max_orientation_error
                 ):
-                    raise ValueError("撤回轨迹插值超出关节/工作空间限制或偏离直线路径")
+                    raise ValueError("直线轨迹插值超出关节/工作空间限制或偏离直线路径")
         return trajectory
 
     def compute_fsm_metrics(self, spoon_center: np.ndarray, ee_quat_wxyz: np.ndarray) -> dict[str, float | bool]:
@@ -2800,9 +2850,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--follow-pose-topic", default=ArmPolicyDeployNode.DEFAULT_MOUTH_TOPIC, help="Fused mouth PoseStamped; preserve the detection stamp when holding an old target.")
     parser.add_argument("--follow-opening-topic", default="/mouth_opening", help="Selected camera's same-frame stamped 3D lip separation vector, in meters.")
     parser.add_argument("--follow-standoff", type=float, default=0.06, help="Closed-mouth spoon waiting distance, in meters.")
-    parser.add_argument("--follow-insert-depth", type=float, default=0.015, help="Spoon insertion depth beyond the mouth plane, in meters.")
+    parser.add_argument("--follow-horizontal", action=argparse.BooleanOptionalAction, default=True, help="Keep spoon forward axis horizontal and bowl facing up; allow height tracking, then lock height during feeding. Use --no-follow-horizontal for the previous 3D mouth-axis behavior.")
     parser.add_argument("--follow-speed", type=float, default=0.03, help="Visual tracking Cartesian speed, in m/s.")
-    parser.add_argument("--follow-feed-speed", type=float, default=0.015, help="Insertion Cartesian speed, in m/s.")
+    parser.add_argument("--follow-feed-speed", type=float, default=0.03, help="Nominal average speed of the continuous insertion trajectory in m/s, before UR speed scaling.")
     parser.add_argument("--mouth-open-mm", type=float, default=10.0, help="Lip separation threshold to begin mouth-open debounce, in mm.")
     parser.add_argument("--mouth-close-mm", type=float, default=8.0, help="Lip separation threshold to cancel feeding, in mm.")
     parser.add_argument("--mouth-open-hold", type=float, default=0.3, help="Minimum continuous fresh mouth-open interval before insertion, in seconds.")
@@ -2842,18 +2892,22 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         app_args = argv
         ros_args = []
     args = parser.parse_args(app_args)
+    try:
+        visual_config = VisualFollowConfig.from_args(args, ArmPolicyDeployNode)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.visual_follow_after_fixed and not args.fixed_mouth_pose:
         parser.error("--visual-follow-after-fixed 先到固定点，不能与 --vision-mouth 同时使用。")
-    for name in ("follow_standoff", "follow_insert_depth", "follow_speed", "follow_feed_speed", "mouth_open_mm",
+    for name in ("follow_standoff", "follow_speed", "follow_feed_speed", "mouth_open_mm",
                  "mouth_close_mm", "mouth_open_hold", "follow_timeout", "fixed_reach_tolerance"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0.:
             parser.error(f"--{name.replace('_', '-')} 必须是有限正数。")
     if args.mouth_close_mm >= args.mouth_open_mm:
         parser.error("--mouth-close-mm 必须小于 --mouth-open-mm。")
-    if not 0.005 <= args.follow_insert_depth <= 0.03 or args.follow_standoff < 0.03:
-        parser.error("视觉喂入深度必须在 0.005～0.03m，等待距离不得小于 0.03m。")
-    if args.visual_follow_after_fixed and args.withdraw_distance < max(args.follow_insert_depth, ArmPolicyDeployNode.SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M):
+    if args.follow_standoff < 0.03:
+        parser.error("视觉等待距离不得小于 0.03m。")
+    if args.visual_follow_after_fixed and args.withdraw_distance < max(visual_config.insert_depth, ArmPolicyDeployNode.SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M):
         parser.error("视觉跟随模式撤回距离不得小于 0.10m。")
     if not math.isfinite(args.withdraw_distance) or args.withdraw_distance < ArmPolicyDeployNode.FEED_INSERT_DEPTH_MAX_M:
         parser.error("--withdraw-distance 必须是有限数且不小于最大入嘴深度 0.08m，确保归位前勺心已退出嘴平面。")

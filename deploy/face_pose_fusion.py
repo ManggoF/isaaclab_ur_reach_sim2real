@@ -16,6 +16,9 @@ import tf2_geometry_msgs
 
 
 class PoseFusionNode(Node):
+    CAMERA_MODE = 'wrist'  # 保留当前腕部相机选择；可改 'fixed' 或 'auto'（固定优先）。
+    MAX_DETECTION_AGE_S = 0.4
+    POSE_HISTORY_SIZE = 30
     MAX_PUBLISHED_POSITION_STEP_M = 0.02
     MIN_PUBLISHED_AXIS_DOT = 0.95
     POSE_FILTER_ALPHA = 0.35
@@ -29,14 +32,11 @@ class PoseFusionNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.target_frame = 'base_link' # RL 策略观测使用的目标坐标系
         self.mouth_openings = {camera: OrderedDict() for camera in ('wrist', 'fixed')}
+        self.pending_poses = {camera: OrderedDict() for camera in ('wrist', 'fixed')}
+        self.camera_pose_cache = {}
         self.last_selected_key = None
 
-        # --- 2. 状态变量和时间戳 ---
-        self.pose1_raw = None
-        self.pose2_raw = None
-        self.time1 = self.get_clock().now()
-        self.time2 = self.get_clock().now()
-        self.timeout_duration = RclpyDuration(seconds=0.5) # 0.5秒内未收到，则认为该相机目标无效
+        # --- 2. 最近接受的目标，保持时不刷新检测时间戳 ---
         self.last_published_pose = None
         self.last_published_axis = None
         self.last_accepted_time = None
@@ -65,7 +65,7 @@ class PoseFusionNode(Node):
         self.timer = self.create_timer(0.02, self.fusion_timer_callback)
         
         self.get_logger().info(
-            "Pose Fusion 节点已就绪，双相机自动模式；"
+            f"Pose Fusion 节点已就绪，camera_mode={self.CAMERA_MODE}，按检测时刻 TF 转换；"
             f"发布前过滤: max_step={self.MAX_PUBLISHED_POSITION_STEP_M:.3f}m, "
             f"min_axis_dot={self.MIN_PUBLISHED_AXIS_DOT:.2f}, alpha={self.POSE_FILTER_ALPHA:.2f}, "
             "hold_last_pose=unlimited"
@@ -90,12 +90,42 @@ class PoseFusionNode(Node):
             self.opening_publisher.publish(opening)
         
     def pose1_callback(self, msg: PoseStamped):
-        self.pose1_raw = msg
-        self.time1 = self.get_clock().now()
+        self.remember_pose('wrist', msg)
 
     def pose2_callback(self, msg: PoseStamped):
-        self.pose2_raw = msg
-        self.time2 = self.get_clock().now()
+        self.remember_pose('fixed', msg)
+
+    def remember_pose(self, camera, msg):
+        history = self.pending_poses[camera]
+        history[self.stamp_ns(msg)] = self.copy_pose(msg)
+        while len(history) > self.POSE_HISTORY_SIZE:
+            history.popitem(last=False)
+
+    def latest_transformable_pose(self, camera, now):
+        """Keep pending frames until TF catches up; never block or use newer TF."""
+        history = self.pending_poses[camera]
+        cached = self.camera_pose_cache.get(camera)
+        last_stamp = self.stamp_ns(cached[0]) if cached else 0
+        for stamp in sorted(history, reverse=True):
+            age = (now.nanoseconds - stamp) * 1e-9
+            if stamp <= last_stamp or stamp <= 0 or age > self.MAX_DETECTION_AGE_S or age < -0.05:
+                del history[stamp]
+                continue
+            raw = history[stamp]
+            pose = self.get_pose_in_base(raw)
+            if pose is not None:
+                cached = (raw, pose)
+                self.camera_pose_cache[camera] = cached
+                # Newer frames whose TF has not arrived remain queued.
+                for old in list(history):
+                    if old <= stamp:
+                        del history[old]
+                break
+        if cached is not None:
+            age = (now.nanoseconds - self.stamp_ns(cached[0])) * 1e-9
+            if -0.05 <= age <= self.MAX_DETECTION_AGE_S:
+                return cached
+        return None
         
     def get_pose_in_base(self, raw_pose_stamped: PoseStamped) -> PoseStamped or None:
         """将 PoseStamped 从其 frame_id 转换到策略观测坐标系下"""
@@ -103,25 +133,21 @@ class PoseFusionNode(Node):
             return None
             
         try:
-            # 沿用 /mouth_pose 的最新 TF 转换，不另等采集时刻的 TF。
-            latest_time = rclpy.time.Time()
+            # 腕部相机随机器人移动，必须使用检测时刻的 TF。
+            # 最新 TF 会把图像处理延迟变成虚假的嘴部移动。
+            acquisition_time = rclpy.time.Time.from_msg(raw_pose_stamped.header.stamp)
             # 检查 TF 变换是否可用
             if not self.tf_buffer.can_transform(self.target_frame, raw_pose_stamped.header.frame_id, 
-                                                latest_time):
+                                                acquisition_time):
                 self.get_logger().warn(
-                    f'等待从 {raw_pose_stamped.header.frame_id} 到 {self.target_frame} 的变换...', 
+                    f'等待检测时刻从 {raw_pose_stamped.header.frame_id} 到 {self.target_frame} 的变换（缓存重试，不阻塞）...',
                     throttle_duration_sec=2.0
                 )
                 return None
     
-            # 查询使用时间 0；输出仍保留检测时刻，便于识别保持的旧目标。
-            lookup_pose = PoseStamped()
-            lookup_pose.header.frame_id = raw_pose_stamped.header.frame_id
-            lookup_pose.header.stamp = latest_time.to_msg()
-            lookup_pose.pose = raw_pose_stamped.pose
             # 执行 TF 变换
             transformed_pose = self.tf_buffer.transform(
-                lookup_pose,
+                self.copy_pose(raw_pose_stamped),
                 self.target_frame,
                 timeout=RclpyDuration()
             )
@@ -137,33 +163,17 @@ class PoseFusionNode(Node):
         """定时器回调，执行融合逻辑"""
         
         now = self.get_clock().now()
-        # 1. 检查数据新鲜度
-        is_pose1_valid = self.pose1_raw is not None and (now - self.time1) < self.timeout_duration
-        is_pose2_valid = self.pose2_raw is not None and (now - self.time2) < self.timeout_duration
-        
-        # 2. 将有效位姿转换到策略观测坐标系
-        pose1_base = self.get_pose_in_base(self.pose1_raw) if is_pose1_valid else None
-        pose2_base = self.get_pose_in_base(self.pose2_raw) if is_pose2_valid else None
-        
-        is_pose1_ready = pose1_base is not None
-        is_pose2_ready = pose2_base is not None
-
         final_pose_msg = None
         holding_last_pose = False
-        
-        # 3. 沿用固定相机优先、腕部相机补充的目标选择。
-        if is_pose2_ready:
-            camera, raw = 'fixed', self.pose2_raw
-            final_pose_msg = pose2_base
-            self.get_logger().info("双相机目标融合：使用固定相机 2", throttle_duration_sec=1.0)
-            
-        elif is_pose1_ready:
-            camera, raw = 'wrist', self.pose1_raw
-            final_pose_msg = pose1_base
-            self.get_logger().info("双相机目标融合：使用腕部相机 1", throttle_duration_sec=1.0)
-            
-        else:
-            final_pose_msg = self.hold_last_pose(now, "当前所有人脸目标均无效或被遮挡")
+        cameras = {'wrist': ('wrist',), 'fixed': ('fixed',), 'auto': ('fixed', 'wrist')}[self.CAMERA_MODE]
+        for camera in cameras:
+            selected = self.latest_transformable_pose(camera, now)
+            if selected is not None:
+                raw, final_pose_msg = selected
+                self.get_logger().info(f'使用相机: {camera}', throttle_duration_sec=1.0)
+                break
+        if final_pose_msg is None:
+            final_pose_msg = self.hold_last_pose(now, '所选相机无有效检测或检测时刻 TF 尚未就绪')
             if final_pose_msg is None:
                 return
             holding_last_pose = True
