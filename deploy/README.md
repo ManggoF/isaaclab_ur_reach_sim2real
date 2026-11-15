@@ -237,6 +237,9 @@ python3 deploy/reset_arm.py --execute
 
 ### 3.6 终端 D：先检查推理，再执行任务
 
+本节的 `--vision-mouth` 是直接让策略使用视觉目标。
+“策略先到固定点，再视觉跟随，张嘴后喂入”的新流程请使用第 3.8 节的 `--visual-follow-after-fixed`。
+
 使用视觉目标进行不发布运动的检查：
 
 ```bash
@@ -286,6 +289,99 @@ python3 deploy/run_task.py
 通常先在任务终端按 `Ctrl+C` 保存并退出，再停止相机识别和底层启动终端。
 完整轨迹已经下发后，退出 Python 不保证控制器立即停止；需要立即停止运动时使用示教器停止或急停。
 
+### 3.8 策略到固定点后，视觉跟随并按张嘴喂入
+
+该模式通过命令行显式开启，直接运行不带参数的 `run_task.py` 仍使用原固定目标流程。
+沿用前面的 UR driver、相机 TF 和相机识别启动顺序；更新代码后需要重新启动
+`camera_perception_launch.sh`，使识别与融合节点发布新的带时间戳话题。
+无需重新编译本仓库中的 Python 文件。
+
+先在项目根目录检查新鲜数据：
+
+```bash
+ros2 topic echo /mouth_tracking_pose --once
+ros2 topic echo /mouth_tracking_opening --once
+```
+
+正式执行命令：
+
+```bash
+python3 deploy/run_task.py --visual-follow-after-fixed
+```
+
+只检查、不发布运动的命令：
+
+```bash
+python3 deploy/run_task.py --visual-follow-after-fixed --dry-run --debug-obs --debug-wrench
+```
+
+`--dry-run` 不会让机械臂自行到固定点，因此它只能预览当前位置对应阶段的输出，
+不会凭空模拟整段实机运动。离线完整流程由第 6 节测试覆盖。
+该模式不能与 `--vision-mouth` 同时使用。
+
+流程与默认值：
+
+1. **APPROACH**：原 arm 策略先到用户设置的固定点。勺心距固定点不超过 15 mm，
+   或满足原成功几何条件，连续 5 个控制步后交给视觉控制，不执行原成功保持/归位。
+   这个固定点应是进入视觉跟随的过渡位置，需要位于真实嘴部之外。
+2. **VISUAL_TRACK**：arm actor 停止推理；视觉闭环使用当前 ROS 轨迹控制器跟随嘴部，
+   勺心目标为 `嘴中心 − 进入嘴巴的方向 × 0.06 m`，并缓慢对齐勺子前进轴。
+   标称跟随速度 0.03 m/s，接收视觉数据后低通处理；运动指令至多约 10 Hz 更新，
+   避免 30 Hz 连续重发导致控制器的轨迹时钟反复重启。仍保留关节限速和工作空间检查。
+3. **VISUAL_FEED**：同一台相机的位姿和开口数据匹配、新鲜，开口达到 10 mm 并持续至少
+   0.3 秒、勺心距等待目标不超过 8 mm、方向误差不超过 5°且机器人稳定后，锁定嘴位置/嘴轴与当前工具姿态。
+   以标称 0.015 m/s 朝锁定目标喂入嘴平面后 15 mm；不在喂入途中追赶移动的头部。
+4. **SUCCESS_HOLD → SUCCESS_WITHDRAW → RESET**：达到喂入目标并稳定后，保持 30 个控制步，
+   沿锁定进入方向的反方向一次下发连续撤回 10 cm 轨迹，再按原逻辑归位、保存曲线。
+
+闭嘴等待期间，实时位姿超过 0.4 秒无更新、单次跳变超过 5 cm/30°、目标越界，
+或嘴位置超出视觉接管点附近 25 cm 时，保持当前位置，等待有效数据或超时退出。
+喂入/保持期间，闭嘴至 8 mm 以下、视觉或开口数据失效、嘴位置偏移超过 2 cm/嘴轴变化超过 10°，
+或力/力矩超限时，转入安全撤回 10 cm 再归位；这项喂入中止逻辑不依赖 `safety_strenthen` 开关。
+如果机器人反馈或控制器失效，先停止继续喂入，不能在没有反馈时盲目撤回。
+喂入阶段自身有 15 秒超时，整个流程仍受 episode 超时/步数限制。
+标称速度仍受控制器响应、原 safety 调节和 UR 速度缩放影响。
+
+原安全层仍计算风险和增益。学习 safety 的六点嘴部近似包含嘴中心点；
+仅在 `VISUAL_FEED`、匹配的新鲜张嘴数据有效、径向误差不超过 8 mm、嘴平面前后 3 cm、
+轴向对齐误差不超过 5°时，不将通过这个中心点视为“嘴部特征点接触”。
+力觉、轴向顶碰、脸部和偏离中心通道的检测保留。规则安全模式保留原有保守干预，
+可能主动中止喂入。完整正常流程已使用学习 safety 和模拟反馈验证。
+
+新视觉流与原 `/mouth_pose` 分开：
+
+| 话题 | 内容 |
+| --- | --- |
+| `/<wrist或fixed>_face_pose_node/mouth_opening` | `Vector3Stamped`，同帧上下嘴唇的三维分离向量，单位米；向量模长 × 1000 为开口 mm |
+| `/mouth_tracking_pose` | `PoseStamped`，转换到 `base_link` 的实时嘴位姿，保留 SDK 取帧时刻的 ROS 时间戳 |
+| `/mouth_tracking_opening` | 所选相机的同帧开口向量，保留其相机 frame 和采集时间戳 |
+
+实时流默认只使用**腕部相机**，不保持历史目标，也不会在腕部相机被遮挡时自动切换到固定相机。
+原 `/mouth_pose` 仍保留固定相机优先、遮挡后保持上一目标的行为；新模式不依赖这个保持结果。
+腕部位姿使用采集时间对应的 TF 转换，遇到 `实时跟随流等待采集时刻 TF` 时应检查机器人 TF、
+相机标定 TF 和消息/时钟一致性。
+
+若需要改为固定相机跟随，停止原融合进程，在已运行识别节点的前提下单独启动：
+
+```bash
+python3 deploy/face_pose_fusion.py --ros-args -p tracking_camera:=fixed
+```
+
+`tracking_camera` 还支持 `auto`：腕部优先，无新鲜腕部位姿时尝试固定相机。
+切换后的跳变仍受任务节点限制。不要同时运行两份融合节点。
+
+常用调参示例（在项目根目录）：
+
+```bash
+python3 deploy/run_task.py --visual-follow-after-fixed \
+  --follow-standoff 0.06 --follow-insert-depth 0.015 \
+  --mouth-open-mm 10 --mouth-close-mm 8 --mouth-open-hold 0.3 \
+  --follow-speed 0.03 --follow-feed-speed 0.015
+```
+
+识别沿用旧代码的三维嘴唇距离算法，开口阈值需根据窗口显示和实际测量调整，
+不能把 10 mm 阈值当成已经验证的勺子通行尺寸。
+
 ## 4. 常用参数与输出
 
 ### 4.1 命令行参数
@@ -293,6 +389,7 @@ python3 deploy/run_task.py
 | 参数 | 当前默认值/作用 |
 | --- | --- |
 | `--vision-mouth` | 使用视觉目标；不传时默认固定目标 |
+| `--visual-follow-after-fixed` | 策略到固定点后切换实时嘴跟随，再按张嘴进入喂入流程；详见第 3.8 节 |
 | `--dry-run` | 只推理/预览，不发布运动 |
 | `--debug-obs` | 打印低频观测、动作、安全状态诊断 |
 | `--debug-wrench` | 打印力觉诊断，并额外保存 wrench CSV |
@@ -658,7 +755,7 @@ python3 deploy/run_task.py --vision-mouth --dry-run \
 需要修改撤回/安全加强代码时，可在项目根目录运行：
 
 ```bash
-python3 -m unittest deploy.tests.test_success_withdraw deploy.tests.test_safety_strengthen -v
+python3 -m unittest discover -s deploy/tests -t . -v
 ```
 
 这些测试使用本地模拟反馈和发布器，不创建 ROS 节点或连接机器人；

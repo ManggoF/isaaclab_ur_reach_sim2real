@@ -9,7 +9,7 @@ from std_msgs.msg import Float32
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor # 引入多线程执行器
-from geometry_msgs.msg import PoseStamped 
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from scipy.spatial.transform import Rotation as R
 
 class FacePosePublisher(Node):
@@ -27,6 +27,7 @@ class FacePosePublisher(Node):
         # 【新增】嘴巴距离发布器
         # 话题名: /{node_name}/mouth_dist
         self.mouth_dist_publisher_ = self.create_publisher(Float32, f'/{node_name}/mouth_dist', 10)
+        self.mouth_opening_publisher_ = self.create_publisher(Vector3Stamped, f'/{node_name}/mouth_opening', 10)
         # 【新增】用于存储最新的图像给主线程显示
         self.latest_image = None
         
@@ -117,6 +118,8 @@ class FacePosePublisher(Node):
 
         if not depth_frame or not color_frame:
             return
+        # Pose and lip opening share one acquisition stamp; do not refresh it in fusion.
+        acquisition_stamp = self.get_clock().now().to_msg()
         # --- [关键修改 A] 保存原始数据 (未旋转前) 用于位姿计算 ---
         # raw_color_image = np.asanyarray(color_frame.get_data()) 
         # raw_depth_image = np.asanyarray(depth_frame.get_data()) 
@@ -262,13 +265,19 @@ class FacePosePublisher(Node):
                         mouth_msg = Float32()
                         mouth_msg.data = vertical_dist_mm
                         self.mouth_dist_publisher_.publish(mouth_msg)
+                        opening = Vector3Stamped()
+                        opening.header.stamp = acquisition_stamp
+                        opening.header.frame_id = self.camera_frame_id
+                        separation = np.array(pos_bottom) - np.array(pos_top)
+                        opening.vector.x, opening.vector.y, opening.vector.z = map(float, separation)
+                        self.mouth_opening_publisher_.publish(opening)
                         self.get_logger().info(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_mm:.2f} mm")
                     # -----------------------------------------------------------------
                     
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
                     rotation_vector_final, _ = cv2.Rodrigues(rotation_matrix)
                     pose_msg = PoseStamped()
-                    pose_msg.header.stamp = self.get_clock().now().to_msg()
+                    pose_msg.header.stamp = acquisition_stamp
                     
                     pose_msg.header.frame_id = self.camera_frame_id 
                     

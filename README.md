@@ -116,6 +116,15 @@ Follow these steps to run the simulation:
 当前 UR5e 实机部署的启动顺序、双相机识别、控制器激活/切换与常见报错处理，
 见 [deploy 部署说明（中文）](deploy/README.md)。
 
+新增“策略到固定点 → 视觉跟随 → 张嘴喂入 → 撤回归位”模式，在相机识别与融合运行后执行：
+
+```bash
+python3 deploy/run_task.py --visual-follow-after-fixed
+```
+
+默认使用腕部相机，闭嘴时在嘴前 6 cm 跟随，持续张嘴且对准后喂入 1.5 cm，再撤回 10 cm 并归位。
+参数、实时视觉话题及中止条件见部署说明第 3.8 节；不带该开关时保留原固定目标流程。
+
 After stable insertion succeeds, deployment holds for 30 control steps, then
 withdraws 10 cm along the reverse of the latched mouth entry axis while maintaining
 the end-effector orientation. The complete withdrawal is planned and published

@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from python.controllers.harl_arm_policy import HarlArmPolicy
 from python.utils.joint_angle_recorder import JointAngleRecorder
 from python.utils.ur5e_kinematics import UR5eDLSIK, quat_apply_wxyz, quat_xyzw_to_wxyz
+from deploy.visual_mouth_follow import VisualMouthFollowMixin
 
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "sample/actor_agent_arm_torchscript.pt"
@@ -45,7 +46,7 @@ SAFETY_GAIN_VIS_DIR = PROJECT_ROOT / "logs" / "safety_gain_visualization"
 JOINT_ANGLE_RECORD_DIR = PROJECT_ROOT / "logs" / "joint_angle_records"
 
 
-class ArmPolicyDeployNode(Node):
+class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     """ROS2 node that deploys only the trained HARL arm policy on UR5e."""
 
     STATE_TOPIC = "/scaled_joint_trajectory_controller/controller_state"
@@ -354,6 +355,7 @@ class ArmPolicyDeployNode(Node):
         self.create_subscription(Float64, self.SPEED_SCALING_TOPIC, self.speed_scaling_callback, 10)
         # 58维策略始终依赖 wrench；debug_wrench 只控制额外日志和CSV记录。
         self.create_subscription(WrenchStamped, self.WRENCH_TOPIC, self.wrench_callback, 10)
+        self.init_visual_follow(args)
 
         self.pub = self.create_publisher(JointTrajectory, self.CMD_TOPIC, 10)
         self.timer = self.create_timer(self.control_period, self.step_callback)
@@ -362,6 +364,13 @@ class ArmPolicyDeployNode(Node):
 
         mode = "dry-run，只打印不发关节轨迹" if args.dry_run else "motion enabled，会发布关节轨迹"
         self.get_logger().info(f"arm policy 部署节点已启动: {mode}")
+        if self.visual_follow_enabled:
+            self.get_logger().info(
+                f"固定点后视觉跟随已启用: standoff={args.follow_standoff:.3f}m, "
+                f"insert={args.follow_insert_depth:.3f}m, "
+                f"opening={args.mouth_open_mm:.1f}mm/{args.mouth_open_hold:.2f}s；"
+                f"实时目标={args.follow_pose_topic}，开口={args.follow_opening_topic}。"
+            )
         self.get_logger().info(
             f"safety_strenthen={self.safety_strenthen}: "
             "开启时有效 grec > 0 即锁定撤回 10 cm 再归位；"
@@ -842,6 +851,19 @@ class ArmPolicyDeployNode(Node):
         min_feature_dist = float(np.min(feature_dists)) if feature_dists.size > 0 else float("inf")
         # 这个阈值是“预入嘴阶段的嘴部连杆/点云接触”判断，满足就直接算 hazard -> RETREAT。
         linkage_contact_before_insert = bool(min_feature_dist < float(self.SAFETY_POLICY_LINK_THRESHOLD) and pre_insert)
+        if self.visual_follow_started and self.fsm_state == "VISUAL_FEED":
+            # The six-point proxy includes a point at the mouth CENTER. It must not
+            # count the explicitly authorized open-hole crossing as lip contact.
+            # Preserve force/poke/face gates and off-axis contact detection.
+            visual_channel = (
+                self.visual_opening_ready()
+                and self.visual_paired_gap_mm >= self.visual_follow_config.open_mm
+                and spoon_radial <= self.visual_follow_config.align_tolerance
+                and abs(mouth_depth) <= 0.03
+                and float(np.dot(spoon_dir_w, mouth_axis_w)) >= math.cos(math.radians(5.))
+            )
+            if visual_channel:
+                linkage_contact_before_insert = False
         linkage_intrusion_risk = (
             float(np.clip((float(self.SAFETY_POLICY_LINK_THRESHOLD) - min_feature_dist) / max(float(self.SAFETY_POLICY_LINK_THRESHOLD), 1.0e-6), 0.0, 1.0))
             * float(linkage_contact_before_insert)
@@ -1757,6 +1779,9 @@ class ArmPolicyDeployNode(Node):
         if self.fsm_state in {"SUCCESS_WITHDRAW", "SAFETY_WITHDRAW"}:
             self.update_success_withdraw()
             return
+        if self.visual_follow_started:
+            self.step_visual_follow()
+            return
         if self.data_is_stale():
             return
         if not self.args.dry_run and not self.ros_control_is_ready():
@@ -1905,6 +1930,14 @@ class ArmPolicyDeployNode(Node):
         if elapsed_s >= self.args.episode_length_s or self.policy_step >= self.max_episode_steps:
             self.stop_episode("TIMEOUT", f"超过 episode 限制: elapsed={elapsed_s:.2f}s, steps={self.policy_step}", spoon_center)
             return True
+
+        if self.visual_follow_enabled and self.fsm_state == "APPROACH":
+            reached_fixed = metrics["mouth_spoon_dist"] <= self.visual_follow_config.fixed_tolerance or metrics["feed_reached"]
+            self.feed_stable_steps = self.feed_stable_steps + 1 if reached_fixed else 0
+            if self.feed_stable_steps >= self.FEED_STABLE_STEPS_REQUIRED:
+                self.start_visual_follow(spoon_center, ee_quat_wxyz)
+                return True
+            return False
 
         if metrics["feed_reached"]:
             self.feed_stable_steps += 1
@@ -2599,7 +2632,7 @@ class ArmPolicyDeployNode(Node):
     def build_mouth_feature_points(self) -> np.ndarray:
         assert self.mouth_pos is not None
         assert self.mouth_quat_wxyz is not None
-        if self.args.fixed_mouth_pose:
+        if self.args.fixed_mouth_pose and not self.visual_follow_started:
             # 固定嘴复用 play 日志中的 6 个 link 形状，但跟随当前 fixed mouth center 平移。
             fixed_offsets = self.DEFAULT_FIXED_MOUTH_FEATURE_POINTS - self.DEFAULT_FIXED_MOUTH_FEATURE_CENTER
             return self.mouth_pos.reshape(1, 3) + fixed_offsets
@@ -2763,6 +2796,18 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.set_defaults(fixed_mouth_pose=True)
     parser.add_argument("--fixed-mouth-pose", dest="fixed_mouth_pose", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vision-mouth", dest="fixed_mouth_pose", action="store_false", help="Use /mouth_pose instead of the fixed sim-like mouth target.")
+    parser.add_argument("--visual-follow-after-fixed", action="store_true", help="After policy reaches the fixed point, track the live mouth, feed on stable opening, then withdraw/reset.")
+    parser.add_argument("--follow-pose-topic", default="/mouth_tracking_pose", help="Live-only stamped mouth pose (held/frozen targets must not be used).")
+    parser.add_argument("--follow-opening-topic", default="/mouth_tracking_opening", help="Same-frame stamped 3D lip separation vector, in meters.")
+    parser.add_argument("--follow-standoff", type=float, default=0.06, help="Closed-mouth spoon waiting distance, in meters.")
+    parser.add_argument("--follow-insert-depth", type=float, default=0.015, help="Spoon insertion depth beyond the mouth plane, in meters.")
+    parser.add_argument("--follow-speed", type=float, default=0.03, help="Visual tracking Cartesian speed, in m/s.")
+    parser.add_argument("--follow-feed-speed", type=float, default=0.015, help="Insertion Cartesian speed, in m/s.")
+    parser.add_argument("--mouth-open-mm", type=float, default=10.0, help="Lip separation threshold to begin mouth-open debounce, in mm.")
+    parser.add_argument("--mouth-close-mm", type=float, default=8.0, help="Lip separation threshold to cancel feeding, in mm.")
+    parser.add_argument("--mouth-open-hold", type=float, default=0.3, help="Minimum continuous fresh mouth-open interval before insertion, in seconds.")
+    parser.add_argument("--follow-timeout", type=float, default=0.4, help="Maximum age of live visual samples, in seconds.")
+    parser.add_argument("--fixed-reach-tolerance", type=float, default=0.015, help="Fixed-point tolerance before visual handoff, in meters.")
     parser.add_argument("--target-frame", default="base_link", help="Robot base frame used by the policy observation.")
     parser.add_argument("--ee-frame", default="wrist_3_link", help="End-effector frame matching the IsaacLab ee_link_name.")
     parser.add_argument("--wrench-source-frame", default="tool0_controller", help="Fallback frame for the UR F/T wrench if the message header is empty.")
@@ -2797,6 +2842,19 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         app_args = argv
         ros_args = []
     args = parser.parse_args(app_args)
+    if args.visual_follow_after_fixed and not args.fixed_mouth_pose:
+        parser.error("--visual-follow-after-fixed 先到固定点，不能与 --vision-mouth 同时使用。")
+    for name in ("follow_standoff", "follow_insert_depth", "follow_speed", "follow_feed_speed", "mouth_open_mm",
+                 "mouth_close_mm", "mouth_open_hold", "follow_timeout", "fixed_reach_tolerance"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0.:
+            parser.error(f"--{name.replace('_', '-')} 必须是有限正数。")
+    if args.mouth_close_mm >= args.mouth_open_mm:
+        parser.error("--mouth-close-mm 必须小于 --mouth-open-mm。")
+    if not 0.005 <= args.follow_insert_depth <= 0.03 or args.follow_standoff < 0.03:
+        parser.error("视觉喂入深度必须在 0.005～0.03m，等待距离不得小于 0.03m。")
+    if args.visual_follow_after_fixed and args.withdraw_distance < max(args.follow_insert_depth, ArmPolicyDeployNode.SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M):
+        parser.error("视觉跟随模式撤回距离不得小于 0.10m。")
     if not math.isfinite(args.withdraw_distance) or args.withdraw_distance < ArmPolicyDeployNode.FEED_INSERT_DEPTH_MAX_M:
         parser.error("--withdraw-distance 必须是有限数且不小于最大入嘴深度 0.08m，确保归位前勺心已退出嘴平面。")
     if args.bite_release_steps is not None and args.feed_hold_steps == 5:

@@ -4,7 +4,7 @@ import numpy as np
 import math
 from scipy.spatial.transform import Rotation as R
 
-from geometry_msgs.msg import PoseStamped 
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from rclpy.duration import Duration as RclpyDuration
 import tf2_ros
 from tf2_ros.buffer import Buffer
@@ -24,6 +24,11 @@ class PoseFusionNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.target_frame = 'base_link' # RL 策略观测使用的目标坐标系
+        self.declare_parameter('tracking_camera', 'wrist')
+        self.tracking_camera = self.get_parameter('tracking_camera').value
+        if self.tracking_camera not in {'wrist', 'fixed', 'auto'}:
+            raise ValueError('tracking_camera 必须为 wrist/fixed/auto')
+        self.tracking_openings = {'wrist': None, 'fixed': None}
 
         # --- 2. 状态变量和时间戳 ---
         self.pose1_raw = None
@@ -45,6 +50,16 @@ class PoseFusionNode(Node):
         
         # --- 4. 发布最终融合后的原始嘴部位姿，供 RL 策略作为 mouth pose 观测 ---
         self.publisher = self.create_publisher(PoseStamped, '/mouth_pose', 10)
+        # Separate live-only stream: existing /mouth_pose may intentionally hold an old target.
+        self.tracking_pose_pub = self.create_publisher(PoseStamped, '/mouth_tracking_pose', 10)
+        self.tracking_opening_pub = self.create_publisher(Vector3Stamped, '/mouth_tracking_opening', 10)
+        self.tracking_opening_subs = [
+            self.create_subscription(
+                Vector3Stamped, f'/{camera}_face_pose_node/mouth_opening',
+                lambda msg, camera=camera: self.tracking_opening_callback(camera, msg), 10,
+            )
+            for camera in ('wrist', 'fixed')
+        ]
         
         # --- 5. 定时器进行融合计算 ---
         # 每 20ms (50Hz) 进行一次融合计算
@@ -56,6 +71,42 @@ class PoseFusionNode(Node):
             f"min_axis_dot={self.MIN_PUBLISHED_AXIS_DOT:.2f}, alpha={self.POSE_FILTER_ALPHA:.2f}, "
             "hold_last_pose=unlimited"
         )
+        self.get_logger().info(f'实时跟随流 /mouth_tracking_pose：camera={self.tracking_camera}，不保持历史目标。')
+
+    @staticmethod
+    def stamp_ns(msg):
+        return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+
+    def tracking_opening_callback(self, camera, msg):
+        self.tracking_openings[camera] = msg
+
+    def publish_live_tracking(self, now):
+        cameras = ('wrist', 'fixed') if self.tracking_camera == 'auto' else (self.tracking_camera,)
+        for camera in cameras:
+            raw = self.pose1_raw if camera == 'wrist' else self.pose2_raw
+            if raw is None:
+                continue
+            stamp = self.stamp_ns(raw)
+            age = (now.nanoseconds - stamp) * 1e-9
+            if stamp <= 0 or age < -0.05 or age > 0.4:
+                continue
+            pos = self.pose_position_array(raw)
+            quat = self.pose_quat_array(raw)
+            if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(quat)) or np.linalg.norm(quat) < 1e-6:
+                continue
+            try:
+                # Wrist camera moves: use TF at acquisition, not the latest wrist pose.
+                pose = self.tf_buffer.transform(raw, self.target_frame, timeout=RclpyDuration(seconds=0.02))
+            except tf2_ros.TransformException as exc:
+                self.get_logger().warn(f'实时跟随流等待采集时刻 TF: {exc}', throttle_duration_sec=1.0)
+                continue
+            pose.header.stamp = raw.header.stamp
+            self.tracking_pose_pub.publish(pose)
+            opening = self.tracking_openings[camera]
+            if opening is not None and self.stamp_ns(opening) == stamp and opening.header.frame_id == raw.header.frame_id:
+                # Vector length is rotation invariant; retain its actual camera frame.
+                self.tracking_opening_pub.publish(opening)
+            return
         
     def pose1_callback(self, msg: PoseStamped):
         self.pose1_raw = msg
@@ -108,6 +159,7 @@ class PoseFusionNode(Node):
         """定时器回调，执行融合逻辑"""
         
         now = self.get_clock().now()
+        self.publish_live_tracking(now)
         # 1. 检查数据新鲜度
         is_pose1_valid = self.pose1_raw is not None and (now - self.time1) < self.timeout_duration
         is_pose2_valid = self.pose2_raw is not None and (now - self.time2) < self.timeout_duration
