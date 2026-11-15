@@ -271,7 +271,7 @@ class FacePosePublisher(Node):
                         separation = np.array(pos_bottom) - np.array(pos_top)
                         opening.vector.x, opening.vector.y, opening.vector.z = map(float, separation)
                         self.mouth_opening_publisher_.publish(opening)
-                        self.get_logger().info(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_mm:.2f} mm")
+                        self.get_logger().info(f"[{self.get_name()}] Mouth Dist (3D): {vertical_dist_mm:.2f} mm", throttle_duration_sec=0.5)
                     # -----------------------------------------------------------------
                     
                     # --- 步骤 3: 组合位姿，并以 PoseStamped 格式发布 ---
@@ -296,7 +296,8 @@ class FacePosePublisher(Node):
                     # --- 步骤 4: 发布最终的位姿指令 ---
                     self.publisher_.publish(pose_msg)
                     self.get_logger().info(
-                        f'[{self.get_name()}] Pos: ({pos_in_camera_frame[0]:.2f}, {pos_in_camera_frame[1]:.2f}, {pos_in_camera_frame[2]:.2f})'
+                        f'[{self.get_name()}] Pos: ({pos_in_camera_frame[0]:.2f}, {pos_in_camera_frame[1]:.2f}, {pos_in_camera_frame[2]:.2f})',
+                        throttle_duration_sec=0.5,
                     )
                     
 

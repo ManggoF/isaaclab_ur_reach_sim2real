@@ -205,7 +205,8 @@ ros2 run tf2_ros tf2_echo base_link fixed_cam_optical_frame
 当前融合逻辑**优先使用固定相机**，固定相机无有效目标时使用腕部相机，并非两个位姿取平均。
 两路目标超过 0.5 秒无更新时，融合节点会持续重发最后一个可信目标，日志中出现
 `继续发布上一帧可信嘴巴`；没有保持时长上限。因此，`/mouth_pose` 仍有频率不能证明相机仍在识别，
-还要检查两路原始位姿和识别窗口。
+还要检查两路原始位姿和识别窗口。输出保留原检测时间戳，保持旧目标时不刷新时间戳；
+视觉跟随据此判断过期。`/mouth_opening` 只转发所选相机同帧的开口数据，保持旧目标时不再转发。
 
 ### 3.5 终端 D：归位到策略初始姿态
 
@@ -299,8 +300,8 @@ python3 deploy/run_task.py
 先在项目根目录检查新鲜数据：
 
 ```bash
-ros2 topic echo /mouth_tracking_pose --once
-ros2 topic echo /mouth_tracking_opening --once
+ros2 topic echo /mouth_pose --once
+ros2 topic echo /mouth_opening --once
 ```
 
 正式执行命令：
@@ -324,7 +325,8 @@ python3 deploy/run_task.py --visual-follow-after-fixed --dry-run --debug-obs --d
 1. **APPROACH**：原 arm 策略先到用户设置的固定点。勺心距固定点不超过 15 mm，
    或满足原成功几何条件，连续 5 个控制步后交给视觉控制，不执行原成功保持/归位。
    这个固定点应是进入视觉跟随的过渡位置，需要位于真实嘴部之外。
-2. **VISUAL_TRACK**：arm actor 停止推理；视觉闭环使用当前 ROS 轨迹控制器跟随嘴部，
+2. **VISUAL_TRACK**：arm actor 停止推理；直接订阅融合节点的 `/mouth_pose`，
+   使用当前 ROS 轨迹控制器跟随嘴部，沿用固定相机优先、腕部相机补充的选择逻辑。
    勺心目标为 `嘴中心 − 进入嘴巴的方向 × 0.06 m`，并缓慢对齐勺子前进轴。
    标称跟随速度 0.03 m/s，接收视觉数据后低通处理；运动指令至多约 10 Hz 更新，
    避免 30 Hz 连续重发导致控制器的轨迹时钟反复重启。仍保留关节限速和工作空间检查。
@@ -348,27 +350,24 @@ python3 deploy/run_task.py --visual-follow-after-fixed --dry-run --debug-obs --d
 力觉、轴向顶碰、脸部和偏离中心通道的检测保留。规则安全模式保留原有保守干预，
 可能主动中止喂入。完整正常流程已使用学习 safety 和模拟反馈验证。
 
-新视觉流与原 `/mouth_pose` 分开：
+视觉跟随直接使用原融合路径，不再另建腕部相机实时跟随流：
 
 | 话题 | 内容 |
 | --- | --- |
 | `/<wrist或fixed>_face_pose_node/mouth_opening` | `Vector3Stamped`，同帧上下嘴唇的三维分离向量，单位米；向量模长 × 1000 为开口 mm |
-| `/mouth_tracking_pose` | `PoseStamped`，转换到 `base_link` 的实时嘴位姿，保留 SDK 取帧时刻的 ROS 时间戳 |
-| `/mouth_tracking_opening` | 所选相机的同帧开口向量，保留其相机 frame 和采集时间戳 |
+| `/mouth_pose` | `PoseStamped`，沿用最新 TF 转换到 `base_link` 并过滤，保留原检测时间戳；保持旧目标时也不刷新时间戳 |
+| `/mouth_opening` | 所选相机的同帧开口向量，保留其相机 frame 和原检测时间戳；向量模长用于张嘴判断 |
 
-实时流默认只使用**腕部相机**，不保持历史目标，也不会在腕部相机被遮挡时自动切换到固定相机。
-原 `/mouth_pose` 仍保留固定相机优先、遮挡后保持上一目标的行为；新模式不依赖这个保持结果。
-腕部位姿使用采集时间对应的 TF 转换，遇到 `实时跟随流等待采集时刻 TF` 时应检查机器人 TF、
-相机标定 TF 和消息/时钟一致性。
+融合节点仍会在两路目标都失效时发布最后一个位置，但跟随节点不会将重复发布当作新检测。
+没有新检测超过 `--follow-timeout`（默认 0.4 秒）时，等待阶段保持当前位置，
+喂入阶段则按原逻辑撤回。重复的开口数据也不会累计张嘴持续时间。
+同帧开口暂未到达时可以跟随有效嘴位姿，暂不允许喂入。
+相机切换后的跳变仍受任务节点限制。
 
-若需要改为固定相机跟随，停止原融合进程，在已运行识别节点的前提下单独启动：
-
-```bash
-python3 deploy/face_pose_fusion.py --ros-args -p tracking_camera:=fixed
-```
-
-`tracking_camera` 还支持 `auto`：腕部优先，无新鲜腕部位姿时尝试固定相机。
-切换后的跳变仍受任务节点限制。不要同时运行两份融合节点。
+不再需要原 `/mouth_tracking_pose`、`/mouth_tracking_opening` 或 `tracking_camera` 参数。
+任务日志会显示 `融合目标=/mouth_pose，开口=/mouth_opening` 和 `已接收融合嘴部目标`。
+如果 `/mouth_pose` 有频率但任务仍提示过期，检查融合日志是否正在“保持上一帧可信嘴巴”，
+以及原始相机位姿是否继续更新。不要同时运行两份融合节点。
 
 常用调参示例（在项目根目录）：
 
@@ -396,6 +395,7 @@ python3 deploy/run_task.py --visual-follow-after-fixed \
 | `--model-path` | 默认 `sample/actor_agent_arm_torchscript.pt` |
 | `--policy-backend` | 默认 `auto`，可选 `torchscript`、`numpy` |
 | `--mouth-topic` | 默认 `/mouth_pose`，消息类型 `geometry_msgs/msg/PoseStamped` |
+| `--follow-pose-topic` / `--follow-opening-topic` | 固定点后跟随使用的融合话题，默认 `/mouth_pose` / `/mouth_opening` |
 | `--control-hz` | 默认 `30` Hz |
 | `--withdraw-distance` | 成功撤回距离，默认 `0.10` m，不能小于 `0.08` m；不改变安全加强的固定 10 cm |
 | `--wrench-bias-samples` | 默认静态采集 `30` 个样本做 tare；`0` 表示关闭 tare |

@@ -51,6 +51,7 @@ class VisualMouthFollowMixin:
     def init_visual_follow(self, args):
         self.visual_follow_enabled = bool(args.visual_follow_after_fixed)
         self.visual_follow_config = VisualFollowConfig.from_args(args)
+        self.visual_pose_topic = args.follow_pose_topic
         self.visual_follow_started = False
         self.visual_mouth_pos = None
         self.visual_mouth_axis = None
@@ -58,6 +59,10 @@ class VisualMouthFollowMixin:
         self.visual_raw_axis = None
         self.visual_pose_stamp_ns = None
         self.visual_pose_rejected = False
+        self.visual_pose_received_count = 0
+        self.visual_pose_accepted_count = 0
+        self.visual_last_input_stamp_ns = None
+        self.visual_pose_reject_reason = ''
         self.visual_opening_stamp_ns = None
         self.visual_gap_mm = None
         self.visual_paired_stamp_ns = None
@@ -91,7 +96,14 @@ class VisualMouthFollowMixin:
 
     def visual_pose_callback(self, msg):
         stamp = self.visual_stamp_ns(msg)
-        if not self.visual_stamp_fresh(stamp) or (self.visual_pose_stamp_ns is not None and stamp <= self.visual_pose_stamp_ns):
+        self.visual_pose_received_count += 1
+        self.visual_last_input_stamp_ns = stamp
+        if not self.visual_stamp_fresh(stamp):
+            age = (self.get_clock().now().nanoseconds - stamp) * 1e-9
+            self.visual_pose_reject_reason = f'消息时间戳无效或过期 age={age:.3f}s（上限 {self.visual_follow_config.timeout_s:.2f}s）'
+            self.get_logger().warn('视觉跟随消息被拒绝: ' + self.visual_pose_reject_reason, throttle_duration_sec=1.0)
+            return
+        if self.visual_pose_stamp_ns is not None and stamp <= self.visual_pose_stamp_ns:
             return
         try:
             pose = msg if msg.header.frame_id == self.target_frame else self.tf_buffer.transform(msg, self.target_frame)
@@ -99,10 +111,12 @@ class VisualMouthFollowMixin:
             quat = np.array([pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z, pose.pose.orientation.w])
             if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(quat)) or np.linalg.norm(quat) < 1e-6:
                 self.visual_pose_rejected = True
+                self.visual_pose_reject_reason = '位置或四元数无效'
                 return
             axis = -R.from_quat(quat).apply([0., 0., 1.])
         except Exception as exc:
             self.visual_pose_rejected = True
+            self.visual_pose_reject_reason = f'位姿转换失败: {exc}'
             self.get_logger().warn(f"视觉跟随位姿转换失败: {exc}", throttle_duration_sec=1.0)
             return
         cfg = self.visual_follow_config
@@ -111,10 +125,13 @@ class VisualMouthFollowMixin:
             angle = math.acos(float(np.clip(np.dot(axis, self.visual_raw_axis), -1., 1.)))
             if jump > cfg.max_pose_jump or angle > cfg.max_axis_jump_rad:
                 self.visual_pose_rejected = True
-                self.get_logger().warn("视觉跟随目标跳变，本帧拒绝更新。", throttle_duration_sec=1.0)
+                self.visual_pose_reject_reason = f'目标跳变: distance={jump:.3f}m, angle={math.degrees(angle):.1f}deg'
+                self.get_logger().warn("视觉跟随目标跳变，本帧拒绝更新: " + self.visual_pose_reject_reason, throttle_duration_sec=1.0)
                 return
         self.visual_raw_pos, self.visual_raw_axis = pos.copy(), axis.copy()
         self.visual_pose_rejected = False
+        self.visual_pose_reject_reason = ''
+        self.visual_pose_accepted_count += 1
         if self.visual_mouth_pos is None:
             self.visual_mouth_pos, self.visual_mouth_axis = pos.copy(), axis.copy()
         else:
@@ -124,6 +141,20 @@ class VisualMouthFollowMixin:
             )
         self.visual_pose_stamp_ns = stamp
         self.pair_visual_sample()
+        self.get_logger().info(
+            f'已接收融合嘴部目标 {self.visual_pose_topic}: age={(self.get_clock().now().nanoseconds - stamp) * 1e-9:.3f}s, '
+            f'pos={np.round(pos, 4)}', throttle_duration_sec=1.0,
+        )
+
+    def visual_wait_status(self):
+        if self.visual_pose_received_count == 0:
+            return f'尚未收到任何 {self.visual_pose_topic} 消息；检查融合节点'
+        if self.visual_pose_reject_reason:
+            return self.visual_pose_reject_reason
+        if self.visual_pose_stamp_ns is None:
+            return f'已收到 {self.visual_pose_received_count} 条消息，但没有有效位姿'
+        age = (self.get_clock().now().nanoseconds - self.visual_pose_stamp_ns) * 1e-9
+        return f'最后有效位姿 age={age:.3f}s（上限 {self.visual_follow_config.timeout_s:.2f}s）'
 
     def visual_opening_callback(self, msg):
         stamp = self.visual_stamp_ns(msg)
@@ -244,7 +275,7 @@ class VisualMouthFollowMixin:
             if feeding:
                 self.abort_visual_feed(spoon, quat, "视觉目标丢失、跳变或过期")
             else:
-                self.hold_visual_position("等待新鲜视觉嘴部位姿，不使用融合节点保持的历史目标。")
+                self.hold_visual_position("等待新鲜视觉嘴部位姿: " + self.visual_wait_status())
             return
         if feeding:
             moved = np.linalg.norm(self.visual_raw_pos - self.visual_feed_mouth) > cfg.feed_motion_tolerance

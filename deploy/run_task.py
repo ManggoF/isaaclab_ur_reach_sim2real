@@ -369,7 +369,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
                 f"固定点后视觉跟随已启用: standoff={args.follow_standoff:.3f}m, "
                 f"insert={args.follow_insert_depth:.3f}m, "
                 f"opening={args.mouth_open_mm:.1f}mm/{args.mouth_open_hold:.2f}s；"
-                f"实时目标={args.follow_pose_topic}，开口={args.follow_opening_topic}。"
+                f"融合目标={args.follow_pose_topic}，开口={args.follow_opening_topic}。"
             )
         self.get_logger().info(
             f"safety_strenthen={self.safety_strenthen}: "
@@ -2796,9 +2796,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.set_defaults(fixed_mouth_pose=True)
     parser.add_argument("--fixed-mouth-pose", dest="fixed_mouth_pose", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vision-mouth", dest="fixed_mouth_pose", action="store_false", help="Use /mouth_pose instead of the fixed sim-like mouth target.")
-    parser.add_argument("--visual-follow-after-fixed", action="store_true", help="After policy reaches the fixed point, track the live mouth, feed on stable opening, then withdraw/reset.")
-    parser.add_argument("--follow-pose-topic", default="/mouth_tracking_pose", help="Live-only stamped mouth pose (held/frozen targets must not be used).")
-    parser.add_argument("--follow-opening-topic", default="/mouth_tracking_opening", help="Same-frame stamped 3D lip separation vector, in meters.")
+    parser.add_argument("--visual-follow-after-fixed", action="store_true", help="After policy reaches the fixed point, follow /mouth_pose, feed on stable opening, then withdraw/reset.")
+    parser.add_argument("--follow-pose-topic", default=ArmPolicyDeployNode.DEFAULT_MOUTH_TOPIC, help="Fused mouth PoseStamped; preserve the detection stamp when holding an old target.")
+    parser.add_argument("--follow-opening-topic", default="/mouth_opening", help="Selected camera's same-frame stamped 3D lip separation vector, in meters.")
     parser.add_argument("--follow-standoff", type=float, default=0.06, help="Closed-mouth spoon waiting distance, in meters.")
     parser.add_argument("--follow-insert-depth", type=float, default=0.015, help="Spoon insertion depth beyond the mouth plane, in meters.")
     parser.add_argument("--follow-speed", type=float, default=0.03, help="Visual tracking Cartesian speed, in m/s.")

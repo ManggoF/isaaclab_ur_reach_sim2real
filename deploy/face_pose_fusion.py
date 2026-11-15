@@ -1,5 +1,8 @@
 import rclpy
+from collections import OrderedDict
+from copy import deepcopy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 import numpy as np
 import math
 from scipy.spatial.transform import Rotation as R
@@ -16,6 +19,7 @@ class PoseFusionNode(Node):
     MAX_PUBLISHED_POSITION_STEP_M = 0.02
     MIN_PUBLISHED_AXIS_DOT = 0.95
     POSE_FILTER_ALPHA = 0.35
+    OPENING_HISTORY_SIZE = 30
 
     def __init__(self):
         super().__init__('pose_fusion_node')
@@ -24,11 +28,8 @@ class PoseFusionNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.target_frame = 'base_link' # RL 策略观测使用的目标坐标系
-        self.declare_parameter('tracking_camera', 'wrist')
-        self.tracking_camera = self.get_parameter('tracking_camera').value
-        if self.tracking_camera not in {'wrist', 'fixed', 'auto'}:
-            raise ValueError('tracking_camera 必须为 wrist/fixed/auto')
-        self.tracking_openings = {'wrist': None, 'fixed': None}
+        self.mouth_openings = {camera: OrderedDict() for camera in ('wrist', 'fixed')}
+        self.last_selected_key = None
 
         # --- 2. 状态变量和时间戳 ---
         self.pose1_raw = None
@@ -50,13 +51,11 @@ class PoseFusionNode(Node):
         
         # --- 4. 发布最终融合后的原始嘴部位姿，供 RL 策略作为 mouth pose 观测 ---
         self.publisher = self.create_publisher(PoseStamped, '/mouth_pose', 10)
-        # Separate live-only stream: existing /mouth_pose may intentionally hold an old target.
-        self.tracking_pose_pub = self.create_publisher(PoseStamped, '/mouth_tracking_pose', 10)
-        self.tracking_opening_pub = self.create_publisher(Vector3Stamped, '/mouth_tracking_opening', 10)
-        self.tracking_opening_subs = [
+        self.opening_publisher = self.create_publisher(Vector3Stamped, '/mouth_opening', 10)
+        self.opening_subs = [
             self.create_subscription(
                 Vector3Stamped, f'/{camera}_face_pose_node/mouth_opening',
-                lambda msg, camera=camera: self.tracking_opening_callback(camera, msg), 10,
+                lambda msg, camera=camera: self.mouth_opening_callback(camera, msg), 10,
             )
             for camera in ('wrist', 'fixed')
         ]
@@ -71,42 +70,24 @@ class PoseFusionNode(Node):
             f"min_axis_dot={self.MIN_PUBLISHED_AXIS_DOT:.2f}, alpha={self.POSE_FILTER_ALPHA:.2f}, "
             "hold_last_pose=unlimited"
         )
-        self.get_logger().info(f'实时跟随流 /mouth_tracking_pose：camera={self.tracking_camera}，不保持历史目标。')
+        self.get_logger().info('视觉跟随直接使用 /mouth_pose 和同相机同帧 /mouth_opening；保持目标时保留原检测时间戳。')
 
     @staticmethod
     def stamp_ns(msg):
         return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
-    def tracking_opening_callback(self, camera, msg):
-        self.tracking_openings[camera] = msg
+    def mouth_opening_callback(self, camera, msg):
+        history = self.mouth_openings[camera]
+        history[self.stamp_ns(msg)] = msg
+        while len(history) > self.OPENING_HISTORY_SIZE:
+            history.popitem(last=False)
 
-    def publish_live_tracking(self, now):
-        cameras = ('wrist', 'fixed') if self.tracking_camera == 'auto' else (self.tracking_camera,)
-        for camera in cameras:
-            raw = self.pose1_raw if camera == 'wrist' else self.pose2_raw
-            if raw is None:
-                continue
-            stamp = self.stamp_ns(raw)
-            age = (now.nanoseconds - stamp) * 1e-9
-            if stamp <= 0 or age < -0.05 or age > 0.4:
-                continue
-            pos = self.pose_position_array(raw)
-            quat = self.pose_quat_array(raw)
-            if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(quat)) or np.linalg.norm(quat) < 1e-6:
-                continue
-            try:
-                # Wrist camera moves: use TF at acquisition, not the latest wrist pose.
-                pose = self.tf_buffer.transform(raw, self.target_frame, timeout=RclpyDuration(seconds=0.02))
-            except tf2_ros.TransformException as exc:
-                self.get_logger().warn(f'实时跟随流等待采集时刻 TF: {exc}', throttle_duration_sec=1.0)
-                continue
-            pose.header.stamp = raw.header.stamp
-            self.tracking_pose_pub.publish(pose)
-            opening = self.tracking_openings[camera]
-            if opening is not None and self.stamp_ns(opening) == stamp and opening.header.frame_id == raw.header.frame_id:
-                # Vector length is rotation invariant; retain its actual camera frame.
-                self.tracking_opening_pub.publish(opening)
-            return
+    def publish_matching_opening(self, camera, raw):
+        """Only forward the selected camera's opening from this acquisition."""
+        opening = self.mouth_openings[camera].get(self.stamp_ns(raw))
+        if opening is not None and opening.header.frame_id == raw.header.frame_id:
+            # Vector length is rotation invariant; retain its camera frame.
+            self.opening_publisher.publish(opening)
         
     def pose1_callback(self, msg: PoseStamped):
         self.pose1_raw = msg
@@ -122,8 +103,7 @@ class PoseFusionNode(Node):
             return None
             
         try:
-            # --- 修改点 1: 检查变换时使用 Time(nanoseconds=0) ---
-            # rclpy.time.Time() 等同于 Time(nanoseconds=0)，代表获取该链路上最新的数据
+            # 沿用 /mouth_pose 的最新 TF 转换，不另等采集时刻的 TF。
             latest_time = rclpy.time.Time()
             # 检查 TF 变换是否可用
             if not self.tf_buffer.can_transform(self.target_frame, raw_pose_stamped.header.frame_id, 
@@ -134,20 +114,18 @@ class PoseFusionNode(Node):
                 )
                 return None
     
-            # --- 修改点 2: 转换时不使用消息里的 stamp，而是强制用最新时间 ---
-            # 创建一个新的消息副本，把它的时间戳改为 0
-            # 这样 tf2_geometry_msgs 内部会去查找最新的变换，而不是查找“半小时前”的变换
+            # 查询使用时间 0；输出仍保留检测时刻，便于识别保持的旧目标。
             lookup_pose = PoseStamped()
             lookup_pose.header.frame_id = raw_pose_stamped.header.frame_id
-            lookup_pose.header.stamp = latest_time.to_msg() # 关键：强制设为最新
+            lookup_pose.header.stamp = latest_time.to_msg()
             lookup_pose.pose = raw_pose_stamped.pose
             # 执行 TF 变换
             transformed_pose = self.tf_buffer.transform(
                 lookup_pose,
                 self.target_frame,
-                timeout=RclpyDuration(seconds=0.1)
+                timeout=RclpyDuration()
             )
-            
+            transformed_pose.header.stamp = deepcopy(raw_pose_stamped.header.stamp)
             return transformed_pose
         
         except tf2_ros.TransformException as ex:
@@ -159,7 +137,6 @@ class PoseFusionNode(Node):
         """定时器回调，执行融合逻辑"""
         
         now = self.get_clock().now()
-        self.publish_live_tracking(now)
         # 1. 检查数据新鲜度
         is_pose1_valid = self.pose1_raw is not None and (now - self.time1) < self.timeout_duration
         is_pose2_valid = self.pose2_raw is not None and (now - self.time2) < self.timeout_duration
@@ -174,20 +151,16 @@ class PoseFusionNode(Node):
         final_pose_msg = None
         holding_last_pose = False
         
-        # 3. 融合逻辑 (T_base^face)
-        # if is_pose1_ready and is_pose2_ready:
-        #     # final_pose_msg = self.average_poses(pose1_base, pose2_base)
-        #     final_pose_msg = pose1_base
-        #     self.get_logger().debug("双相机目标融合：使用腕部相机 1")
-
+        # 3. 沿用固定相机优先、腕部相机补充的目标选择。
         if is_pose2_ready:
-            # 策略：只要腕部相机就绪，就使用它的结果，实现最高优先级。
+            camera, raw = 'fixed', self.pose2_raw
             final_pose_msg = pose2_base
-            self.get_logger().info("双相机目标融合：使用固定相机 2")
+            self.get_logger().info("双相机目标融合：使用固定相机 2", throttle_duration_sec=1.0)
             
         elif is_pose1_ready:
+            camera, raw = 'wrist', self.pose1_raw
             final_pose_msg = pose1_base
-            self.get_logger().info("双相机目标融合：使用腕部相机 1")
+            self.get_logger().info("双相机目标融合：使用腕部相机 1", throttle_duration_sec=1.0)
             
         else:
             final_pose_msg = self.hold_last_pose(now, "当前所有人脸目标均无效或被遮挡")
@@ -197,11 +170,17 @@ class PoseFusionNode(Node):
 
         # RL 策略需要真实嘴部 pose 作为观测，不需要投喂姿态修正或 TCP 偏移。
         if not holding_last_pose:
-            final_pose_msg = self.filter_pose_before_publish(final_pose_msg, now)
+            key = (camera, self.stamp_ns(raw))
+            if key != self.last_selected_key:
+                final_pose_msg = self.filter_pose_before_publish(final_pose_msg, now)
+                self.last_selected_key = key
+            else:
+                final_pose_msg = self.copy_pose(self.last_published_pose)
             if final_pose_msg is None:
                 return
-        final_pose_msg.header.stamp = now.to_msg()
         self.publisher.publish(final_pose_msg)
+        if not holding_last_pose:
+            self.publish_matching_opening(camera, raw)
         self.get_logger().info(
             f"发布 /mouth_pose ({self.target_frame}) -> "
             f"X:{final_pose_msg.pose.position.x:.3f}, "
@@ -244,7 +223,7 @@ class PoseFusionNode(Node):
             )
 
         filtered_pose = PoseStamped()
-        filtered_pose.header = pose_msg.header
+        filtered_pose.header = deepcopy(pose_msg.header)
         alpha = self.POSE_FILTER_ALPHA
         filtered_pos = (1.0 - alpha) * last_pos + alpha * limited_pos
         filtered_pose.pose.position.x = float(filtered_pos[0])
@@ -277,7 +256,6 @@ class PoseFusionNode(Node):
 
         hold_age_s = (now - self.last_accepted_time).nanoseconds * 1.0e-9
         held_pose = self.copy_pose(self.last_published_pose)
-        held_pose.header.stamp = now.to_msg()
         self.get_logger().warn(
             f"{reason}，继续发布上一帧可信嘴巴: hold_age={hold_age_s:.2f}s",
             throttle_duration_sec=0.5,
@@ -287,7 +265,7 @@ class PoseFusionNode(Node):
     @staticmethod
     def copy_pose(pose_msg: PoseStamped) -> PoseStamped:
         copied = PoseStamped()
-        copied.header = pose_msg.header
+        copied.header = deepcopy(pose_msg.header)
         copied.pose.position.x = pose_msg.pose.position.x
         copied.pose.position.y = pose_msg.pose.position.y
         copied.pose.position.z = pose_msg.pose.position.z
@@ -365,13 +343,18 @@ class PoseFusionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PoseFusionNode()
+    # TF subscriptions use a reentrant group; keep receiving them while the
+    # mutually exclusive fusion/camera callbacks run in the other worker.
+    executor = MultiThreadedExecutor(num_threads=2)
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
+        rclpy.spin(node, executor=executor)
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

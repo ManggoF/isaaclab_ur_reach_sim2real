@@ -1,12 +1,15 @@
 """Exercise visual handoff and feeding with FK feedback; no robot connection."""
 
 from copy import deepcopy
+from collections import OrderedDict
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from rclpy.duration import Duration
+from rclpy.time import Time
 
 from deploy.face_pose_fusion import PoseFusionNode
 from deploy.run_task import ArmPolicyDeployNode, parse_args
@@ -23,6 +26,8 @@ class HybridNode(OfflineDeployNode):
         self.args.min_spoon_z = 0.06
         self.args.max_mouth_spoon_distance = 3.
         self.args.visual_follow_after_fixed = False  # No ROS subscriptions in this fake.
+        self.args.follow_pose_topic = '/mouth_pose'
+        self.args.follow_opening_topic = '/mouth_opening'
         self.args.follow_standoff = 0.06
         self.args.follow_insert_depth = 0.015
         self.args.follow_speed = 0.03
@@ -297,6 +302,12 @@ class VisualMouthFollowTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     parse_args()
 
+    def test_follow_defaults_use_the_existing_fused_pose(self):
+        with patch('sys.argv', ['run_task.py', '--visual-follow-after-fixed']):
+            args, _ = parse_args()
+        self.assertEqual(args.follow_pose_topic, '/mouth_pose')
+        self.assertEqual(args.follow_opening_topic, '/mouth_opening')
+
     def test_waiting_point_does_not_fake_entered_stage_or_widen_channel(self):
         node = HybridNode()
         node.begin_tracking()
@@ -313,48 +324,142 @@ class VisualMouthFollowTest(unittest.TestCase):
         self.assertTrue(node.learned_safety_hazard_now(state))
 
 
-class LiveFusionTest(unittest.TestCase):
+class MouthPoseFusionTest(unittest.TestCase):
     def fake_fusion(self):
         node = object.__new__(PoseFusionNode)
-        node.tracking_camera = 'wrist'
+        node.now_ns = 10_000_000_000
+        node.get_clock = Mock(return_value=SimpleNamespace(now=lambda: Time(nanoseconds=node.now_ns)))
+        node.get_logger = Mock(return_value=Mock())
         node.pose1_raw = None
         node.pose2_raw = None
+        node.time1 = node.time2 = Time(nanoseconds=node.now_ns)
+        node.timeout_duration = Duration(seconds=0.5)
         node.target_frame = 'base_link'
-        node.tracking_openings = {'wrist': None, 'fixed': None}
-        node.tracking_pose_pub = Mock()
-        node.tracking_opening_pub = Mock()
-        node.tf_buffer = SimpleNamespace(transform=Mock(side_effect=lambda msg, *a, **kw: deepcopy(msg)))
+        node.mouth_openings = {camera: OrderedDict() for camera in ('wrist', 'fixed')}
+        node.last_selected_key = None
+        node.last_published_pose = node.last_published_axis = node.last_accepted_time = None
+        node.publisher = Mock()
+        node.opening_publisher = Mock()
+
+        def transform(msg, *args, **kwargs):
+            transformed = deepcopy(msg)
+            transformed.header.frame_id = 'base_link'
+            return transformed
+
+        node.tf_buffer = SimpleNamespace(can_transform=Mock(return_value=True), transform=Mock(side_effect=transform))
         return node
 
-    def test_live_output_keeps_acquisition_stamp_and_matches_camera(self):
+    def camera_sample(self, node, camera, gap_mm=15., stamp=None, publish_opening=True):
         source = HybridNode()
-        pose, opening = source.send_sample()
-        pose.header.frame_id = 'wrist_cam_optical_frame'
-        node = self.fake_fusion()
-        node.pose1_raw = pose
-        node.tracking_openings['wrist'] = opening
-        node.publish_live_tracking(SimpleNamespace(nanoseconds=source.now_ns + 30_000_000))
-        result = node.tracking_pose_pub.publish.call_args.args[0]
-        self.assertEqual(PoseFusionNode.stamp_ns(result), source.now_ns)
-        node.tracking_opening_pub.publish.assert_called_once_with(opening)
-        node.tracking_opening_pub.publish.reset_mock()
-        node.tracking_openings['wrist'] = None
-        node.tracking_openings['fixed'] = opening
-        node.publish_live_tracking(SimpleNamespace(nanoseconds=source.now_ns + 30_000_000))
-        node.tracking_opening_pub.publish.assert_not_called()
+        pose, opening = source.send_sample(gap_mm=gap_mm, stamp=node.now_ns if stamp is None else stamp)
+        pose.header.frame_id = f'{camera}_cam_optical_frame'
+        opening.header.frame_id = pose.header.frame_id
+        if camera == 'fixed':
+            node.pose2_callback(pose)
+        else:
+            node.pose1_callback(pose)
+        if publish_opening:
+            node.mouth_opening_callback(camera, opening)
+        return pose, opening
 
-    def test_live_output_does_not_publish_stale_pose_or_mismatched_opening(self):
-        source = HybridNode()
-        pose, opening = source.send_sample()
+    def test_fixed_camera_pose_and_opening_are_used_together(self):
         node = self.fake_fusion()
-        node.pose1_raw = pose
-        node.tracking_openings['wrist'] = opening
-        node.publish_live_tracking(SimpleNamespace(nanoseconds=source.now_ns + 500_000_000))
-        node.tracking_pose_pub.publish.assert_not_called()
-        opening.header.stamp.nanosec += 1
-        node.publish_live_tracking(SimpleNamespace(nanoseconds=source.now_ns + 30_000_000))
-        node.tracking_pose_pub.publish.assert_called_once()
-        node.tracking_opening_pub.publish.assert_not_called()
+        self.camera_sample(node, 'wrist', gap_mm=25.)
+        pose, opening = self.camera_sample(node, 'fixed', gap_mm=5.)
+        node.now_ns += 30_000_000
+        node.fusion_timer_callback()
+        result = node.publisher.publish.call_args.args[0]
+        self.assertEqual(result.header.frame_id, 'base_link')
+        self.assertEqual(result.header.stamp, pose.header.stamp)
+        node.opening_publisher.publish.assert_called_once_with(opening)
+        self.assertEqual(node.last_selected_key[0], 'fixed')
+
+    def test_wrist_camera_is_used_when_fixed_camera_disappears(self):
+        node = self.fake_fusion()
+        self.camera_sample(node, 'fixed', gap_mm=5.)
+        node.fusion_timer_callback()
+        node.now_ns += 600_000_000
+        pose, opening = self.camera_sample(node, 'wrist', gap_mm=25.)
+        node.fusion_timer_callback()
+        self.assertEqual(node.last_selected_key[0], 'wrist')
+        self.assertEqual(node.publisher.publish.call_args.args[0].header.stamp, pose.header.stamp)
+        self.assertEqual(node.opening_publisher.publish.call_args.args[0], opening)
+
+    def test_latest_tf_is_used_without_waiting_for_image_time(self):
+        node = self.fake_fusion()
+        pose, _ = self.camera_sample(node, 'wrist')
+        node.now_ns += 30_000_000
+        node.fusion_timer_callback()
+        query = node.tf_buffer.transform.call_args
+        self.assertEqual(PoseFusionNode.stamp_ns(query.args[0]), 0)
+        self.assertEqual(query.kwargs['timeout'], Duration())
+        self.assertEqual(node.publisher.publish.call_args.args[0].header.stamp, pose.header.stamp)
+
+    def test_held_pose_does_not_refresh_detection_or_repeat_opening(self):
+        node = self.fake_fusion()
+        pose, opening = self.camera_sample(node, 'fixed')
+        node.fusion_timer_callback()
+        first = deepcopy(node.publisher.publish.call_args.args[0])
+        node.opening_publisher.publish.reset_mock()
+        node.now_ns += 2_000_000_000
+        node.fusion_timer_callback()
+        held = node.publisher.publish.call_args.args[0]
+        self.assertEqual(held, first)
+        self.assertEqual(pose.header.stamp, first.header.stamp)
+        node.opening_publisher.publish.assert_not_called()
+
+        # Repeated /mouth_pose publication must not authorize feeding on a
+        # historical open mouth when both detectors have lost the target.
+        task = HybridNode()
+        task.begin_tracking()
+        task.visual_pose_callback(first)
+        task.visual_opening_callback(opening)
+        for _ in range(30):
+            task.now_ns += 30_000_000
+            task.visual_pose_callback(held)
+            task.tick()
+        self.assertEqual(task.fsm_state, 'VISUAL_TRACK')
+        self.assertFalse(task.visual_opening_ready())
+
+    def test_late_opening_is_forwarded_only_for_the_selected_frame(self):
+        node = self.fake_fusion()
+        pose, opening = self.camera_sample(node, 'fixed', publish_opening=False)
+        node.mouth_opening_callback('wrist', opening)
+        node.fusion_timer_callback()
+        node.opening_publisher.publish.assert_not_called()
+        mismatched = deepcopy(opening)
+        mismatched.header.stamp.nanosec += 1
+        node.mouth_opening_callback('fixed', mismatched)
+        node.fusion_timer_callback()
+        node.opening_publisher.publish.assert_not_called()
+        node.mouth_opening_callback('fixed', opening)
+        node.fusion_timer_callback()
+        node.opening_publisher.publish.assert_called_once_with(opening)
+        self.assertEqual(node.publisher.publish.call_args.args[0].header.stamp, pose.header.stamp)
+
+    def test_repeated_image_does_not_count_as_new_detection(self):
+        node = self.fake_fusion()
+        self.camera_sample(node, 'fixed')
+        node.fusion_timer_callback()
+        accepted = node.last_accepted_time
+        first = deepcopy(node.publisher.publish.call_args.args[0])
+        node.now_ns += 100_000_000
+        node.fusion_timer_callback()
+        self.assertEqual(node.last_accepted_time, accepted)
+        self.assertEqual(node.publisher.publish.call_args.args[0], first)
+
+    def test_opening_history_is_bounded(self):
+        node = self.fake_fusion()
+        for i in range(100):
+            self.camera_sample(node, 'fixed', stamp=node.now_ns + i)
+        self.assertEqual(len(node.mouth_openings['fixed']), node.OPENING_HISTORY_SIZE)
+
+    def test_pose_copy_does_not_share_the_detection_stamp(self):
+        node = self.fake_fusion()
+        pose, _ = self.camera_sample(node, 'fixed')
+        copied = node.copy_pose(pose)
+        copied.header.stamp.sec += 1
+        self.assertNotEqual(copied.header.stamp, pose.header.stamp)
 
 
 if __name__ == '__main__':
