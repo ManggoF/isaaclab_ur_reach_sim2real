@@ -103,7 +103,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     FEED_INSERT_DEPTH_MIN_M = 0.008
     FEED_INSERT_DEPTH_MAX_M = 0.080
     # 固定点后的视觉控制调参，单位 m；修改后重新运行，无需附加命令行参数。
-    VISUAL_INSERT_DEPTH_M = -0.005  # 嘴平面前 5 mm；比 +0.005 少前送 1 cm，仅改变喂入终点。
+    VISUAL_INSERT_DEPTH_M = -0.008  # 嘴平面前 5 mm；比 +0.005 少前送 1 cm，仅改变喂入终点。
     VISUAL_INSERT_DEPTH_MIN_M = -0.020  # 允许终点位于视觉嘴平面前最多 2 cm，便于缩短前送。
     VISUAL_INSERT_DEPTH_MAX_M = 0.080  # 最大 8 cm，配合至少 10 cm 撤回，退出嘴平面后再归位。
     VISUAL_FEED_LOCKED_MODE = True  # 张嘴对准后锁定喂入，忽略后续视觉遮挡/闭嘴/头部位移；保留力觉和机器人反馈保护。
