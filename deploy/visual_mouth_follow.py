@@ -35,6 +35,8 @@ class VisualFollowConfig:
     feed_motion_tolerance: float = 0.02
     feed_axis_tolerance_rad: float = math.radians(10.0)
     filter_alpha: float = 0.35
+    position_deadband: float = 0.002
+    angle_deadband_deg: float = 0.5
 
     @classmethod
     def from_args(cls, args, settings):
@@ -48,6 +50,8 @@ class VisualFollowConfig:
         depth = settings.VISUAL_INSERT_DEPTH_M
         try:
             offset = np.asarray(settings.VISUAL_TARGET_OFFSET_M, dtype=np.float64)
+            position_deadband = float(settings.VISUAL_ONLY_POSITION_DEADBAND_M)
+            angle_deadband = float(settings.VISUAL_ONLY_ANGLE_DEADBAND_DEG)
             valid_depth = (math.isfinite(depth)
                            and settings.VISUAL_INSERT_DEPTH_MIN_M <= depth <= settings.VISUAL_INSERT_DEPTH_MAX_M)
         except (TypeError, ValueError):
@@ -60,8 +64,13 @@ class VisualFollowConfig:
             )
         if offset.shape != (3,) or not np.all(np.isfinite(offset)) or np.any(np.abs(offset) > 0.20):
             raise ValueError('run_task.py: VISUAL_TARGET_OFFSET_M 必须是三个 [-0.20, 0.20]m 内的有限数。')
+        if not math.isfinite(position_deadband) or not 0. < position_deadband <= 0.003:
+            raise ValueError('run_task.py: VISUAL_ONLY_POSITION_DEADBAND_M 必须在 (0, 0.003]m 内。')
+        if not math.isfinite(angle_deadband) or not 0. < angle_deadband <= 1.:
+            raise ValueError('run_task.py: VISUAL_ONLY_ANGLE_DEADBAND_DEG 必须在 (0, 1]° 内。')
         return cls(insert_depth=float(depth), target_offset=tuple(map(float, offset)),
                    locked_feed=bool(settings.VISUAL_FEED_LOCKED_MODE),
+                   position_deadband=position_deadband, angle_deadband_deg=angle_deadband,
                    **{key: getattr(args, value) for key, value in mapping.items()})
 
 
@@ -313,10 +322,22 @@ class VisualMouthFollowMixin:
         self.last_fsm_metrics = {}
         self.previous_arm_action.fill(0.)
         self.previous_safety_action.fill(0.)
+        if self.visual_position_priority_enabled():
+            wrist_index = self.JOINT_NAME_TO_IDX['wrist_2_joint']
+            self.ik.lower_limits[wrist_index] = -2. * math.pi
+            self.ik.upper_limits[wrist_index] = 2. * math.pi
+            self.get_logger().info(
+                '纯视觉位置优先：第5关节不锁定0°或限制±15°，沿用±2π关节边界；'
+                '先靠近嘴前等待位置，再逐步对准水平姿态，预测退远的动作不下发。'
+            )
         self.hold_visual_position(
             "直接进入纯视觉跟随；等待新鲜嘴部目标。" if self.visual_only_mode
             else "已到达固定点，切换视觉跟随；等待新鲜嘴部目标。"
         )
+
+    def visual_position_priority_enabled(self):
+        return bool(self.visual_only_mode and not self.args.visual_follow_after_fixed
+                    and self.VISUAL_ONLY_POSITION_PRIORITY)
 
     def set_visual_safety_target(self, pos, axis):
         self.mouth_pos = np.asarray(pos, dtype=np.float32).copy()
@@ -610,13 +631,32 @@ class VisualMouthFollowMixin:
             self.record_wrench_sample(spoon, np.zeros(6), np.zeros(6), np.zeros(6), delta, state, delta)
             self.update_visual_feed_trajectory(ee_pos, quat, spoon, target)
             return
+        if self.visual_position_priority_enabled():
+            error_ik = self.ros_delta_to_ik_delta(np.r_[target - spoon, rotation_error])
+            offset_ik = self.ros_delta_to_ik_delta(np.r_[spoon - ee_pos, np.zeros(3)])[:3]
+            try:
+                joint_target, predicted_delta = self.ik.joint_target_from_spoon_error(
+                    self.current_joint_pos, error_ik[:3], error_ik[3:], offset_ik,
+                    self.args.max_joint_step, cfg.track_speed * horizon, cfg.angular_speed * horizon,
+                    cfg.position_deadband, math.radians(cfg.angle_deadband_deg),
+                )
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                self.hold_visual_position(f'纯视觉位置优先 IK 无有效解: {exc}')
+                return
+            delta = self.ros_delta_to_ik_delta(predicted_delta)
+            if (not np.any(predicted_delta) and (error > cfg.position_deadband
+                    or np.linalg.norm(rotation_error) > math.radians(cfg.angle_deadband_deg))):
+                self.get_logger().warn('纯视觉 IK 暂无满足前进和限位条件的解，保持当前位置。', throttle_duration_sec=1.0)
+        else:
+            joint_target = None
         safe, reason = self.delta_safety_status(ee_pos, quat, delta)
         if not safe:
             self.hold_visual_position(f"视觉动作被工作空间限制阻止: {reason}")
             return
-        joint_target = self.ik.joint_target_from_delta(
-            self.current_joint_pos, self.ros_delta_to_ik_delta(delta), self.args.max_joint_step
-        )
+        if joint_target is None:
+            joint_target = self.ik.joint_target_from_delta(
+                self.current_joint_pos, self.ros_delta_to_ik_delta(delta), self.args.max_joint_step
+            )
         if not np.all(np.isfinite(joint_target)):
             self.stop_episode("FAILURE", "视觉跟随 IK 输出无效", spoon)
             return

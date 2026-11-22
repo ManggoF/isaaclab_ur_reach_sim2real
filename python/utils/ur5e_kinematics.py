@@ -59,6 +59,78 @@ class UR5eDLSIK:
             jacobian[3:, joint_id] = (rot_p * rot.inv()).as_rotvec() / self.eps
         return jacobian
 
+    def joint_target_from_spoon_error(
+        self, q: np.ndarray, spoon_error: np.ndarray, rotation_error: np.ndarray,
+        spoon_offset_world: np.ndarray, max_joint_step: float,
+        translation_step_limit: float, rotation_step_limit: float,
+        position_deadband: float = 0.002, angle_deadband: float = math.radians(0.5),
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Prioritize spoon position, then align in its Jacobian null space.
+
+        All vectors use the DH base frame. The offset is the measured wrist-to-
+        spoon vector in that frame, so predictions are anchored to live TF.
+        Return a bounded joint target and its predicted wrist pose delta.
+        """
+        q = np.asarray(q, dtype=np.float64)
+        error = np.asarray(spoon_error, dtype=np.float64)
+        rot_error = np.asarray(rotation_error, dtype=np.float64)
+        offset = np.asarray(spoon_offset_world, dtype=np.float64)
+        if (q.shape != (6,) or any(v.shape != (3,) for v in (error, rot_error, offset))
+                or not all(np.all(np.isfinite(v)) for v in (q, error, rot_error, offset))):
+            raise ValueError('位置优先 IK 输入无效')
+        distance, angle = float(np.linalg.norm(error)), float(np.linalg.norm(rot_error))
+        if distance <= position_deadband and angle <= angle_deadband:
+            return q.copy(), np.zeros(6)
+        dp = (error * min(1., translation_step_limit / max(distance, 1e-12))
+              if distance > position_deadband else np.zeros(3))
+        dr = (rot_error * min(1., rotation_step_limit / max(angle, 1e-12))
+              if angle > angle_deadband else np.zeros(3))
+        pos, rot = self.fk(q)
+        jacobian = self._numerical_jacobian(q, pos, rot)
+        x, y, z = offset
+        skew = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
+        spoon_jacobian = jacobian[:3] - skew @ jacobian[3:]
+        damping_sq = max(self.damping, 1e-5) ** 2
+        dq_position = spoon_jacobian.T @ np.linalg.solve(
+            spoon_jacobian @ spoon_jacobian.T + damping_sq * np.eye(3), dp,
+        )
+        # Use an actual null-space projector: a damped projector would let
+        # orientation correction undo the spoon's translation near singularities.
+        null = np.eye(6) - np.linalg.pinv(spoon_jacobian, rcond=1e-5) @ spoon_jacobian
+        orient_jacobian = jacobian[3:] @ null
+        dq_orientation = null @ orient_jacobian.T @ np.linalg.solve(
+            orient_jacobian @ orient_jacobian.T + damping_sq * np.eye(3),
+            dr - jacobian[3:] @ dq_position,
+        )
+        # Backtrack against nonlinear FK, not just the local Jacobian prediction.
+        # Inside the position deadband, permit small position error while leveling.
+        for orientation_scale in (1., 0.5, 0.):
+            dq = dq_position + orientation_scale * dq_orientation
+            largest = float(np.max(np.abs(dq)))
+            scale = min(1., max_joint_step / max(largest, 1e-12))
+            for i in range(6):
+                if dq[i] > 1e-12:
+                    scale = min(scale, max(0., (self.upper_limits[i] - q[i]) / dq[i]))
+                elif dq[i] < -1e-12:
+                    scale = min(scale, max(0., (self.lower_limits[i] - q[i]) / dq[i]))
+            for _ in range(12):
+                candidate = q + scale * dq
+                next_pos, next_rot = self.fk(candidate)
+                relative_rot = next_rot * rot.inv()
+                wrist_delta = next_pos - pos
+                spoon_delta = wrist_delta + relative_rot.apply(offset) - offset
+                remaining = float(np.linalg.norm(error - spoon_delta))
+                next_angle = float((R.from_rotvec(rot_error) * relative_rot.inv()).magnitude())
+                position_ok = (remaining < distance - 1e-9 if distance > position_deadband
+                               else remaining <= position_deadband + 1e-9 and next_angle < angle - 1e-9)
+                if (position_ok and np.linalg.norm(spoon_delta) <= translation_step_limit + 1e-9
+                        and relative_rot.magnitude() <= rotation_step_limit + 1e-9
+                        and np.all(candidate >= self.lower_limits) and np.all(candidate <= self.upper_limits)):
+                    return candidate, np.r_[wrist_delta, relative_rot.as_rotvec()]
+                scale *= 0.5
+        # No acceptable progress: hold instead of alternating backward/forward.
+        return q.copy(), np.zeros(6)
+
     @staticmethod
     def _dh(theta: float, a: float, d: float, alpha: float) -> np.ndarray:
         ct, st = math.cos(theta), math.sin(theta)

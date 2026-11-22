@@ -258,8 +258,18 @@ python3 deploy/run_task.py
 不加载或运行 arm/safety actor，无需模型文件；`gslow/glat/grec` 为零，仍计算并记录几何/力觉诊断。
 关节限速、工作空间、独立喂入力/力矩、机器人反馈、TF、超时和曲线记录保留。
 纯视觉的25 cm目标移动范围以首次有效嘴位置为中心，机械臂初始位置距嘴超过25 cm不会因此被拒绝。
-目标仍需在可达工作空间内；这沿用原视觉 IK 跟随，不新增避障路径规划。
+目标仍需在可达工作空间内；视觉 IK 跟随不包含避障路径规划。
 你当前设置的 `VISUAL_INSERT_DEPTH_M=-0.008`、零目标偏置及锁定喂入模式不受这个开关影响。
+
+当 `VISUAL_ONLY_MODE=True`、不带 `--visual-follow-after-fixed` 且
+`VISUAL_ONLY_POSITION_PRIORITY=True` 时，第五关节 `wrist_2_joint` 可以在 ±2π 范围内调整，
+不锁定在 0° 或 ±15°。跟随优先缩小勺心到嘴前等待位置的距离，姿态调整作为次级目标，
+并用正运动学检查候选动作：距离误差大于 2 mm 时，预测会让勺心退远的动作不下发。
+靠近过程中勺子可能暂时偏离水平，随后在保持位置的同时逐步恢复水平和朝向；
+喂入仍要求原有的位置、高度、姿态、稳定和持续张嘴条件全部满足。
+默认 2 mm 位置和 0.5° 姿态死区用于减少对微小视觉噪声的反复修正。
+将 `VISUAL_ONLY_POSITION_PRIORITY=False` 可恢复原跟随控制器；
+带 `--visual-follow-after-fixed` 的运行和策略模式沿用原控制器。喂入、撤回及归位流程保持原逻辑。
 
 将 `VISUAL_ONLY_MODE=False` 保存并重新运行，可恢复下面两种策略流程：
 
@@ -533,6 +543,9 @@ Z 为开始喂入时锁定的勺心高度。当前补偿为零、深度配置 -5
 
 ```python
 VISUAL_ONLY_MODE = True          # True 全程纯视觉；False 恢复原策略/策略后视觉流程
+VISUAL_ONLY_POSITION_PRIORITY = True  # 仅纯视觉且不带 --visual-follow-after-fixed：位置优先，腕部自由调整
+VISUAL_ONLY_POSITION_DEADBAND_M = 0.002  # 位置死区，必须在 (0, 0.003] m 内
+VISUAL_ONLY_ANGLE_DEADBAND_DEG = 0.5    # 姿态死区，必须在 (0, 1] 度内
 VISUAL_INSERT_DEPTH_M = -0.005
 VISUAL_INSERT_DEPTH_MIN_M = -0.020
 VISUAL_INSERT_DEPTH_MAX_M = 0.080

@@ -104,6 +104,9 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     FEED_INSERT_DEPTH_MAX_M = 0.080
     # 视觉控制调参：保存后重新运行，无需附加命令行参数。
     VISUAL_ONLY_MODE = True  # True: 从启动起直接视觉跟随，不加载/运行 arm 和 safety actor；False: 恢复原策略流程。
+    VISUAL_ONLY_POSITION_PRIORITY = True  # 仅纯视觉且不带 --visual-follow-after-fixed：勺心位置优先，腕部自由调整。
+    VISUAL_ONLY_POSITION_DEADBAND_M = 0.002  # 2mm内停止追逐位置噪声；必须不大于喂入高度容差3mm。
+    VISUAL_ONLY_ANGLE_DEADBAND_DEG = 0.5  # 小于喂入姿态门槛1°，避免对准后反复微调。
     VISUAL_INSERT_DEPTH_M = -0.008  # 嘴平面前 5 mm；比 +0.005 少前送 1 cm，仅改变喂入终点。
     VISUAL_INSERT_DEPTH_MIN_M = -0.020  # 允许终点位于视觉嘴平面前最多 2 cm，便于缩短前送。
     VISUAL_INSERT_DEPTH_MAX_M = 0.080  # 最大 8 cm，配合至少 10 cm 撤回，退出嘴平面后再归位。
