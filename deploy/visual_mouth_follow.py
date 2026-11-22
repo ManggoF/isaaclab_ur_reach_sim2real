@@ -66,11 +66,12 @@ class VisualFollowConfig:
 
 
 class VisualMouthFollowMixin:
+    visual_only_mode = False
     visual_follow_enabled = False
     visual_follow_started = False
 
     def init_visual_follow(self, args):
-        self.visual_follow_enabled = bool(args.visual_follow_after_fixed)
+        self.visual_follow_enabled = bool(self.visual_only_mode or args.visual_follow_after_fixed)
         self.visual_follow_config = VisualFollowConfig.from_args(args, self)
         self.visual_pose_topic = args.follow_pose_topic
         self.visual_follow_started = False
@@ -305,13 +306,17 @@ class VisualMouthFollowMixin:
 
     def start_visual_follow(self, spoon_center, ee_quat_wxyz):
         self.visual_follow_started = True
-        self.visual_anchor = np.asarray(spoon_center).copy()
+        self.target_received = True
+        self.visual_anchor = None if self.visual_only_mode else np.asarray(spoon_center).copy()
         self.fsm_state = "VISUAL_TRACK"
         self.feed_stable_steps = 0
         self.last_fsm_metrics = {}
         self.previous_arm_action.fill(0.)
         self.previous_safety_action.fill(0.)
-        self.hold_visual_position("已到达固定点，切换视觉跟随；等待新鲜嘴部目标。")
+        self.hold_visual_position(
+            "直接进入纯视觉跟随；等待新鲜嘴部目标。" if self.visual_only_mode
+            else "已到达固定点，切换视觉跟随；等待新鲜嘴部目标。"
+        )
 
     def set_visual_safety_target(self, pos, axis):
         self.mouth_pos = np.asarray(pos, dtype=np.float32).copy()
@@ -502,9 +507,17 @@ class VisualMouthFollowMixin:
             target = self.visual_feed_target()
             goal_rot = R.from_quat(self.visual_feed_quat[[1, 2, 3, 0]])
         else:
+            if self.visual_anchor is None:
+                mouth = self.corrected_visual_mouth()
+                if (not np.all(np.isfinite(mouth)) or np.any(mouth < self.WORKSPACE_MIN)
+                        or np.any(mouth > self.WORKSPACE_MAX)):
+                    self.hold_visual_position("首次视觉嘴部目标超出工作空间，等待有效目标。")
+                    return
+                self.visual_anchor = mouth.copy()
+                self.get_logger().info(f"纯视觉跟随中心已锁定: mouth_base={np.round(self.visual_anchor, 4)}，跟随范围半径25 cm。")
             if max(np.linalg.norm(self.visual_raw_pos - self.visual_anchor),
                    np.linalg.norm(self.corrected_visual_mouth() - self.visual_anchor)) > cfg.max_travel:
-                self.hold_visual_position("视觉目标超出固定点附近 25 cm 的跟随范围。")
+                self.hold_visual_position("视觉目标超出跟随中心附近 25 cm 的范围。")
                 return
             self.set_visual_safety_target(self.corrected_visual_mouth(), self.visual_mouth_axis)
             target = self.mouth_pos - self.compute_mouth_axis() * cfg.standoff

@@ -102,7 +102,8 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     FEED_INSERT_RADIUS_M = 0.04
     FEED_INSERT_DEPTH_MIN_M = 0.008
     FEED_INSERT_DEPTH_MAX_M = 0.080
-    # 固定点后的视觉控制调参，单位 m；修改后重新运行，无需附加命令行参数。
+    # 视觉控制调参：保存后重新运行，无需附加命令行参数。
+    VISUAL_ONLY_MODE = True  # True: 从启动起直接视觉跟随，不加载/运行 arm 和 safety actor；False: 恢复原策略流程。
     VISUAL_INSERT_DEPTH_M = -0.008  # 嘴平面前 5 mm；比 +0.005 少前送 1 cm，仅改变喂入终点。
     VISUAL_INSERT_DEPTH_MIN_M = -0.020  # 允许终点位于视觉嘴平面前最多 2 cm，便于缩短前送。
     VISUAL_INSERT_DEPTH_MAX_M = 0.080  # 最大 8 cm，配合至少 10 cm 撤回，退出嘴平面后再归位。
@@ -132,7 +133,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     RESET_ACTION_FREEZE_STEPS = 10  # 与仿真一致: reset 后先冻结10个控制步，避免初始饱和动作立刻改变勺子姿态。
     RESET_ACTION_RAMP_STEPS = 12  # 与仿真一致: 冻结结束后用12步把实际位姿增量线性放大到完整值。
     WORKSPACE_MIN = np.array([0.15, -0.65, 0.06], dtype=np.float32)
-    WORKSPACE_MAX = np.array([0.95, 0.95, 0.75], dtype=np.float32)
+    WORKSPACE_MAX = np.array([1.20, 0.95, 0.75], dtype=np.float32)
     SAFETY_EPS = 1.0e-5
     MOUTH_FEATURE_OFFSETS = np.array(
         [
@@ -212,6 +213,25 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     # - face/link/force/poke: 直接触发 RETREAT 锁存
     # - mouth_depth > 0: 才表示勺心沿嘴轴真正进入嘴内，成功门控也依赖这个正向 depth
 
+    def load_control_policies(self, args: argparse.Namespace) -> None:
+        self.visual_only_mode = bool(self.VISUAL_ONLY_MODE)
+        self.policy: HarlArmPolicy | None = None
+        self.safety_policy: HarlArmPolicy | None = None
+        self.rule_safety_enabled = bool(self.RULE_SAFETY_ENABLED and not self.visual_only_mode)
+        self.learned_safety_enabled = bool(
+            self.LOAD_SAFETY_POLICY_WHEN_RULE_OFF and not self.rule_safety_enabled and not self.visual_only_mode
+        )
+        if not self.visual_only_mode:
+            self.policy = HarlArmPolicy(
+                args.model_path, obs_dim=self.ARM_POLICY_OBS_DIM,
+                device=args.device, backend=args.policy_backend,
+            )
+        if self.learned_safety_enabled:
+            self.safety_policy = HarlArmPolicy(
+                str(self.SAFETY_POLICY_MODEL_PATH), obs_dim=self.SAFETY_POLICY_OBS_DIM,
+                action_dim=self.SAFETY_POLICY_ACTION_DIM, device=args.device, backend="auto",
+            )
+
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("arm_policy_deploy_node")
         self.args = args
@@ -224,12 +244,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.policy = HarlArmPolicy(
-            args.model_path,
-            obs_dim=self.ARM_POLICY_OBS_DIM,
-            device=args.device,
-            backend=args.policy_backend,
-        )
+        self.load_control_policies(args)
         self.ik = UR5eDLSIK(damping=args.ik_damping)
 
         self.current_joint_pos: np.ndarray | None = None
@@ -270,7 +285,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         self.reset_start_time_ns: int | None = None
         self.reset_reached_since_ns: int | None = None
         self.reset_timeout_s = 0.0
-        self.fsm_state = "APPROACH"
+        self.fsm_state = "VISUAL_INIT" if self.visual_only_mode else "APPROACH"
         self.feed_stable_steps = 0
         self.success_hold_steps = 0
         self.success_hold_joint_pos: np.ndarray | None = None
@@ -290,20 +305,6 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
             if args.max_episode_steps > 0
             else max(1, int(round(args.episode_length_s * args.control_hz)))
         )
-        self.rule_safety_enabled = bool(self.RULE_SAFETY_ENABLED)
-        # 规则安全关闭时才启用学习 safety actor，避免同一帧同时出现两套 safety 接管逻辑。
-        self.learned_safety_enabled = bool(
-            self.LOAD_SAFETY_POLICY_WHEN_RULE_OFF and not self.rule_safety_enabled
-        )
-        self.safety_policy: HarlArmPolicy | None = None
-        if self.learned_safety_enabled:
-            self.safety_policy = HarlArmPolicy(
-                str(self.SAFETY_POLICY_MODEL_PATH),
-                obs_dim=self.SAFETY_POLICY_OBS_DIM,
-                action_dim=self.SAFETY_POLICY_ACTION_DIM,
-                device=args.device,
-                backend="auto",
-            )
         self.previous_safety_action = np.zeros(self.SAFETY_POLICY_ACTION_DIM, dtype=np.float32)
         self.safety_slow_active = False  # 学习 safety actor 复用仿真中的 slow flag，作为下一帧安全观测的一部分。
         self.save_safety_gain_images = bool(self.SAVE_SAFETY_GAIN_IMAGES)
@@ -335,7 +336,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         if self.save_safety_gain_images or self.save_full_safety_gain_curve:
             SAFETY_GAIN_VIS_DIR.mkdir(parents=True, exist_ok=True)
 
-        if args.fixed_mouth_pose:
+        if args.fixed_mouth_pose and not self.visual_only_mode:
             self.mouth_pos = self.DEFAULT_FIXED_MOUTH_POS.copy()
             self.fixed_mouth_axis = self.DEFAULT_FIXED_MOUTH_AXIS.copy()
             self.mouth_quat_wxyz = self.mouth_quat_from_policy_axis(self.fixed_mouth_axis)
@@ -358,7 +359,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
             self.get_logger().warn(f"无法创建关节角记录文件: {exc}")
 
         self.create_subscription(JointTrajectoryControllerState, self.STATE_TOPIC, self.joint_state_callback, 10)
-        if not args.fixed_mouth_pose:
+        if not args.fixed_mouth_pose and not self.visual_only_mode:
             self.create_subscription(PoseStamped, self.mouth_topic, self.face_pose_callback, 10)
         self.create_subscription(Float64, self.SPEED_SCALING_TOPIC, self.speed_scaling_callback, 10)
         # 58维策略始终依赖 wrench；debug_wrench 只控制额外日志和CSV记录。
@@ -374,7 +375,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         self.get_logger().info(f"arm policy 部署节点已启动: {mode}")
         if self.visual_follow_enabled:
             self.get_logger().info(
-                f"固定点后视觉跟随已启用: standoff={args.follow_standoff:.3f}m, "
+                f"{'全程纯视觉跟随' if self.visual_only_mode else '固定点后视觉跟随'}已启用: standoff={args.follow_standoff:.3f}m, "
                 f"insert={self.visual_follow_config.insert_depth:.3f}m, "
                 f"nominal_feed_travel={args.follow_standoff + self.visual_follow_config.insert_depth:.3f}m, "
                 f"target_offset[forward,person_left,up]={self.visual_follow_config.target_offset}m, "
@@ -384,8 +385,8 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
                 f"融合目标={args.follow_pose_topic}，开口={args.follow_opening_topic}。"
             )
             self.get_logger().info(
-                "视觉跟随模式：从固定点接近阶段起，有效/记录 grec 始终为 0，禁用原安全层撤回及安全加强触发；"
-                "保留减速/居中、正常成功撤回，以及力/力矩、机器人反馈和实际轨迹保护。"
+                "视觉跟随模式：有效/记录 grec 始终为 0，禁用原安全层撤回及安全加强触发；"
+                "保留正常成功撤回，以及力/力矩、机器人反馈和实际轨迹保护。"
             )
             if self.visual_follow_config.locked_feed:
                 self.get_logger().info(
@@ -399,23 +400,30 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
                 f"safety_grec_force_one={self.safety_grec_force_one} "
                 f"（grec记录模式: {'固定为1' if self.safety_grec_force_one else '原安全策略输出'}）。"
             )
-        self.get_logger().info(f"policy request: {Path(args.model_path).expanduser().resolve()}")
-        self.get_logger().info(f"policy loaded: {self.policy.loaded_path}")
-        self.get_logger().info(f"policy backend: {self.policy.backend}")
-        self.get_logger().info(
-            f"arm action: scale={self.args.action_scale_arm:.4f}, limit={self.args.action_limit:.2f}, "
-            f"rotation_scale={self.ARM_ACTION_ROTATION_SCALE:.4f}, action_filter=disabled"
-        )
+        if self.visual_only_mode:
+            self.get_logger().info("VISUAL_ONLY_MODE=True：跳过固定点 APPROACH，不加载或运行 arm/safety 强化学习模型。")
+        else:
+            assert self.policy is not None
+            self.get_logger().info(f"policy request: {Path(args.model_path).expanduser().resolve()}")
+            self.get_logger().info(f"policy loaded: {self.policy.loaded_path}")
+            self.get_logger().info(f"policy backend: {self.policy.backend}")
+            self.get_logger().info(
+                f"arm action: scale={self.args.action_scale_arm:.4f}, limit={self.args.action_limit:.2f}, "
+                f"rotation_scale={self.ARM_ACTION_ROTATION_SCALE:.4f}, action_filter=disabled"
+            )
         self.get_logger().info(
             "joint velocity limits (deg/s): "
             f"{np.round(np.rad2deg(self.JOINT_MAX_VELOCITIES_RAD_S), 1).tolist()}"
         )
-        self.get_logger().info(
-            "arm startup: "
-            f"freeze={self.RESET_ACTION_FREEZE_STEPS} steps, "
-            f"ramp={self.RESET_ACTION_RAMP_STEPS} steps"
-        )
-        if self.rule_safety_enabled:
+        if not self.visual_only_mode:
+            self.get_logger().info(
+                "arm startup: "
+                f"freeze={self.RESET_ACTION_FREEZE_STEPS} steps, "
+                f"ramp={self.RESET_ACTION_RAMP_STEPS} steps"
+            )
+        if self.visual_only_mode:
+            self.get_logger().info("纯视觉控制：视觉误差经 IK 转为关节轨迹；gslow/glat/grec 均为 0，保留独立力觉与运动约束。")
+        elif self.rule_safety_enabled:
             self.get_logger().info(
                 "规则安全层已启用: "
                 f"slow=[{self.RULE_SLOW_FULL_DIST:.3f}, {self.RULE_SLOW_START_DIST:.3f}]m, "
@@ -440,10 +448,11 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
             )
         else:
             self.get_logger().warn("规则安全层和学习 safety actor 均未启用: arm_delta 将不经过 near-mouth safety filter。")
-        self.get_logger().info(
-            "arm policy输入为58维: 52维运动学观测 + 6维腕部force/torque；"
-            "wrench使用8N/1Nm模长限幅、仿真同款缩放和alpha=0.2低通。"
-        )
+        if not self.visual_only_mode:
+            self.get_logger().info(
+                "arm policy输入为58维: 52维运动学观测 + 6维腕部force/torque；"
+                "wrench使用8N/1Nm模长限幅、仿真同款缩放和alpha=0.2低通。"
+            )
         self.get_logger().info(
             "wrench部署对齐: "
             f"source_frame={self.wrench_source_frame or '<msg.header>'}, "
@@ -453,7 +462,12 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         )
         if args.debug_wrench:
             self.get_logger().info(f"wrench debug 已开启: {self.WRENCH_TOPIC} 将额外输出诊断并记录CSV。")
-        if args.fixed_mouth_pose:
+        if self.visual_only_mode:
+            self.get_logger().info(
+                f"直接等待视觉目标 {args.follow_pose_topic}、开口 {args.follow_opening_topic}、{self.STATE_TOPIC}、"
+                f"{self.SPEED_SCALING_TOPIC}、{self.WRENCH_TOPIC} 和 TF {self.target_frame}->{self.ee_frame} ..."
+            )
+        elif args.fixed_mouth_pose:
             self.get_logger().info(
                 "使用固定嘴巴目标: "
                 f"mouth_pos={np.round(self.mouth_pos, 4)}, "
@@ -1169,10 +1183,17 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         """在策略 arm_delta 之后施加确定性安全规则，模拟 safety agent 的三通道增益。"""
         arm_delta = np.asarray(arm_delta, dtype=np.float32).copy()
         if not self.rule_safety_enabled or self.mouth_pos is None:
-            safety_state = self.default_rule_safety_state()
+            safety_state = (
+                self.compute_safety_policy_state(ee_quat_wxyz, spoon_center)
+                if self.visual_only_mode and self.mouth_pos is not None else self.default_rule_safety_state()
+            )
             safety_state["policy_delta_norm"] = float(np.linalg.norm(arm_delta[:3]))
             safety_state["final_delta_norm"] = float(np.linalg.norm(arm_delta[:3]))
-            self.rule_safety_last_state = safety_state
+            if self.visual_only_mode:
+                # Diagnostics need no actor and must not modify the visual motion.
+                self.publish_safety_state(safety_state)
+            else:
+                self.rule_safety_last_state = safety_state
             return arm_delta, safety_state
 
         mouth_axis = self.normalize_vector(self.compute_mouth_axis(), np.array([1.0, 0.0, 0.0], dtype=np.float32))
@@ -1790,7 +1811,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         if self.reset_started and not self.reset_finished:
             self.update_reset_after_success()
             return
-        if not self.target_received:
+        if not self.target_received and not self.visual_only_mode:
             self.get_logger().warn(
                 f"等待视觉嘴部目标 {self.mouth_topic}，尚未开始策略推理。",
                 throttle_duration_sec=1.0,
@@ -1815,7 +1836,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
         if not self.args.dry_run and not self.ros_control_is_ready():
             return
 
-        ee_pose = self.lookup_ee_pose()
+        ee_pose = self.lookup_ee_pose(require_fresh=self.visual_only_mode)
         if ee_pose is None:
             return
         ee_pos, ee_quat_wxyz = ee_pose
@@ -1830,6 +1851,9 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
             )
 
         spoon_center = ee_pos + quat_apply_wxyz(ee_quat_wxyz, self.SPOON_OFFSET)
+        if self.visual_only_mode:
+            self.start_visual_follow(spoon_center, ee_quat_wxyz)
+            return
         if self.update_episode_fsm(spoon_center, ee_quat_wxyz):
             return
 
@@ -2807,7 +2831,8 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
 
     def data_is_stale(self) -> bool:
         now_ns = self.get_clock().now().nanoseconds
-        if not self.args.fixed_mouth_pose and self.fsm_state not in {"SUCCESS_WITHDRAW", "SAFETY_WITHDRAW"}:
+        if (not self.visual_only_mode and not self.args.fixed_mouth_pose
+                and self.fsm_state not in {"SUCCESS_WITHDRAW", "SAFETY_WITHDRAW"}):
             if self.last_face_time_ns is None or (now_ns - self.last_face_time_ns) * 1.0e-9 > self.args.target_timeout:
                 self.get_logger().warn("视觉目标超时，暂停发布策略动作。", throttle_duration_sec=1.0)
                 return True
@@ -2856,7 +2881,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--mouth-open-mm", type=float, default=10.0, help="Lip separation threshold to begin mouth-open debounce, in mm.")
     parser.add_argument("--mouth-close-mm", type=float, default=8.0, help="Lip separation threshold to cancel feeding, in mm.")
     parser.add_argument("--mouth-open-hold", type=float, default=0.3, help="Minimum continuous fresh mouth-open interval before insertion, in seconds.")
-    parser.add_argument("--follow-timeout", type=float, default=0.4, help="Maximum age of live visual samples, in seconds.")
+    parser.add_argument("--follow-timeout", type=float, default=2.4, help="Maximum age of live visual samples, in seconds.")
     parser.add_argument("--fixed-reach-tolerance", type=float, default=0.015, help="Fixed-point tolerance before visual handoff, in meters.")
     parser.add_argument("--target-frame", default="base_link", help="Robot base frame used by the policy observation.")
     parser.add_argument("--ee-frame", default="wrist_3_link", help="End-effector frame matching the IsaacLab ee_link_name.")
@@ -2907,7 +2932,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         parser.error("--mouth-close-mm 必须小于 --mouth-open-mm。")
     if args.follow_standoff < 0.03:
         parser.error("视觉等待距离不得小于 0.03m。")
-    if args.visual_follow_after_fixed and args.withdraw_distance < max(visual_config.insert_depth, ArmPolicyDeployNode.SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M):
+    if (ArmPolicyDeployNode.VISUAL_ONLY_MODE or args.visual_follow_after_fixed) and args.withdraw_distance < max(visual_config.insert_depth, ArmPolicyDeployNode.SAFETY_STRENGTHEN_WITHDRAW_DISTANCE_M):
         parser.error("视觉跟随模式撤回距离不得小于 0.10m。")
     if not math.isfinite(args.withdraw_distance) or args.withdraw_distance < ArmPolicyDeployNode.FEED_INSERT_DEPTH_MAX_M:
         parser.error("--withdraw-distance 必须是有限数且不小于最大入嘴深度 0.08m，确保归位前勺心已退出嘴平面。")

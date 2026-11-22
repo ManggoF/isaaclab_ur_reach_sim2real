@@ -4,8 +4,8 @@
 项目根目录示例为 `~/isaaclab_ur_reach_sim2real`，ROS 工作区为 `~/ros2_ws`，
 Python 环境为 `~/ros_env`。更换电脑时需要替换路径、机器人 IP、相机序列号和标定。
 
-**直接执行 `python3 run_task.py` 会发布运动指令，且默认使用固定嘴部目标。
-使用相机识别的嘴部目标必须加 `--vision-mouth`；只检查推理则加 `--dry-run`。**
+**当前代码 `VISUAL_ONLY_MODE=True`，直接执行 `python3 run_task.py` 会使用视觉跟随并发布运动指令，
+不经过强化学习固定点接近。仅检查、不发布运动时加 `--dry-run`。**
 
 阅读入口：[启动流程](#3-完整启动流程) · [参数与记录](#4-常用参数与输出) ·
 [常见问题](#5-常见问题与解决方法) · [离线测试](#6-离线回归检查)。
@@ -19,7 +19,7 @@ Python 环境为 `~/ros_env`。更换电脑时需要替换路径、机器人 IP�
 | [`dual_camera_face_pose.py`](dual_camera_face_pose.py) | 通过 RealSense SDK 直接打开两台相机，识别人脸并发布嘴部位姿 |
 | [`face_pose_fusion.py`](face_pose_fusion.py) | 将两台相机的结果转换到 `base_link`，选择、过滤后发布 `/mouth_pose` |
 | [`reset_arm.py`](reset_arm.py) | 独立归位工具，默认只预览，`--execute` 才发布轨迹 |
-| [`run_task.py`](run_task.py) | arm/safety 推理、任务状态机、撤回、自动归位和曲线记录 |
+| [`run_task.py`](run_task.py) | 纯视觉或 arm/safety 策略控制、任务状态机、撤回、自动归位和曲线记录 |
 | [`tests/`](tests/) | 离线测试，正常执行任务时不会加载 |
 | 外部工作区的 `my_robot/launch/dual_cam.launch.py` | 发布腕部、固定相机的标定 TF，不包含在本仓库中 |
 
@@ -28,7 +28,7 @@ Python 环境为 `~/ros_env`。更换电脑时需要替换路径、机器人 IP�
 ```text
 腕部相机 → /wrist_face_pose ─┐
                            ├→ face_pose_fusion.py → /mouth_pose（base_link）
-固定相机 → /fixed_face_pose ─┘                          ↓ --vision-mouth
+固定相机 → /fixed_face_pose ─┘                          ↓ 纯视觉/视觉接管
 关节反馈 + 速度缩放 + wrench + 机器人 TF → run_task.py → 轨迹控制器 → UR5e
 ```
 
@@ -238,6 +238,36 @@ python3 deploy/reset_arm.py --execute
 
 ### 3.6 终端 D：先检查推理，再执行任务
 
+当前默认开启纯视觉模式。在 `deploy/run_task.py` 中设置：
+
+```python
+VISUAL_ONLY_MODE = True
+```
+
+随后在项目根目录检查、执行：
+
+```bash
+python3 deploy/run_task.py --dry-run
+# 检查完退出，再正式启动
+python3 deploy/run_task.py
+```
+
+也可以在 `deploy/` 下执行 `python3 run_task.py`，无需 `--visual-follow-after-fixed` 或 `--vision-mouth`。
+当前开关优先于这两个命令行选项。直接进入 `VISUAL_TRACK`，从当前位置跟随新鲜 `/mouth_pose`；
+未收到有效目标时保持当前位置。持续张嘴并对准后，沿用第 3.8 节的锁定喂入、保持、撤回 10 cm 和归位流程。
+不加载或运行 arm/safety actor，无需模型文件；`gslow/glat/grec` 为零，仍计算并记录几何/力觉诊断。
+关节限速、工作空间、独立喂入力/力矩、机器人反馈、TF、超时和曲线记录保留。
+纯视觉的25 cm目标移动范围以首次有效嘴位置为中心，机械臂初始位置距嘴超过25 cm不会因此被拒绝。
+目标仍需在可达工作空间内；这沿用原视觉 IK 跟随，不新增避障路径规划。
+你当前设置的 `VISUAL_INSERT_DEPTH_M=-0.008`、零目标偏置及锁定喂入模式不受这个开关影响。
+
+将 `VISUAL_ONLY_MODE=False` 保存并重新运行，可恢复下面两种策略流程：
+
+- `python3 deploy/run_task.py`：强化学习策略到固定点。
+- `python3 deploy/run_task.py --visual-follow-after-fixed`：策略到固定点后再视觉跟随。
+
+以下说明适用于 `VISUAL_ONLY_MODE=False`：
+
 本节的 `--vision-mouth` 是直接让策略使用视觉目标。
 “策略先到固定点，再视觉跟随，张嘴后喂入”的新流程请使用第 3.8 节的 `--visual-follow-after-fixed`。
 
@@ -284,7 +314,7 @@ python3 deploy/run_task.py
 → 实际反馈确认到位、稳定 → 当前节点直接下发归位轨迹 → 归位完成后保存曲线。
 默认 30 Hz 下保持阶段约为 1 秒。
 
-未启用 `--visual-follow-after-fixed` 且安全加强开启时，有效 `grec > 0` 会跳过成功保持，直接执行撤回 10 cm 再归位。
+`VISUAL_ONLY_MODE=False`、未启用 `--visual-follow-after-fixed` 且安全加强开启时，有效 `grec > 0` 会跳过成功保持，直接执行撤回 10 cm 再归位。
 归位完成后不会自动开始下一次 episode；需要退出并重新运行任务。
 
 通常先在任务终端按 `Ctrl+C` 保存并退出，再停止相机识别和底层启动终端。
@@ -292,7 +322,7 @@ python3 deploy/run_task.py
 
 ### 3.8 策略到固定点后，视觉跟随并按张嘴喂入
 
-该模式通过命令行显式开启，直接运行不带参数的 `run_task.py` 仍使用原固定目标流程。
+`VISUAL_ONLY_MODE=False` 时，该模式通过命令行显式开启；`VISUAL_ONLY_MODE=True` 时直接从视觉阶段开始，跳过下述 `APPROACH`。
 沿用前面的 UR driver、相机 TF 和相机识别启动顺序；更新代码后需要重新启动
 `camera_perception_launch.sh`，使识别与融合节点发布新的带时间戳话题。
 无需重新编译本仓库中的 Python 文件。
@@ -316,7 +346,7 @@ python3 deploy/run_task.py --visual-follow-after-fixed
 风险量仍正常计算和记录，`grec=0` 表示该通道已禁用；`gslow`、`glat` 的减速/居中作用保留。
 成功喂入后的撤回 10 cm 再归位，以及力/力矩、机器人反馈、实际轨迹和超时保护保留。
 默认 `VISUAL_FEED_LOCKED_MODE=True`：张嘴对准后锁定喂入目标，之后视觉遮挡、开口变化和视觉头部位移不打断喂入/保持。
-不带该参数运行时，继续使用原安全撤回机制。
+仅当 `VISUAL_ONLY_MODE=False` 且不带该参数运行时，继续使用原安全撤回机制。
 
 只检查、不发布运动的命令：
 
@@ -476,8 +506,8 @@ Z 为开始喂入时锁定的勺心高度。当前补偿为零、深度配置 -5
 
 | 参数 | 当前默认值/作用 |
 | --- | --- |
-| `--vision-mouth` | 使用视觉目标；不传时默认固定目标 |
-| `--visual-follow-after-fixed` | 策略到固定点后切换实时嘴跟随，再按张嘴进入喂入流程；详见第 3.8 节 |
+| `--vision-mouth` | `VISUAL_ONLY_MODE=False` 时让策略使用视觉目标；纯视觉开关开启时无需传入 |
+| `--visual-follow-after-fixed` | `VISUAL_ONLY_MODE=False` 时策略到固定点后切换嘴跟随；纯视觉开关开启时直接跟随，跳过固定点 |
 | `--dry-run` | 只推理/预览，不发布运动 |
 | `--debug-obs` | 打印低频观测、动作、安全状态诊断 |
 | `--debug-wrench` | 打印力觉诊断，并额外保存 wrench CSV |
@@ -502,6 +532,7 @@ Z 为开始喂入时锁定的勺心高度。当前补偿为零、深度配置 -5
 以下是 `deploy/run_task.py` 中的类属性，修改保存后重新运行生效，不是命令行参数：
 
 ```python
+VISUAL_ONLY_MODE = True          # True 全程纯视觉；False 恢复原策略/策略后视觉流程
 VISUAL_INSERT_DEPTH_M = -0.005
 VISUAL_INSERT_DEPTH_MIN_M = -0.020
 VISUAL_INSERT_DEPTH_MAX_M = 0.080
@@ -518,7 +549,7 @@ SAVE_FULL_SAFETY_GAIN_CURVE = True
 ```
 
 开关拼写保留为 `safety_strenthen`，布尔值使用 Python 的 `True` / `False`。
-启用 `--visual-follow-after-fixed` 时优先强制 `grec=0`，以下安全加强配置行为只适用于未启用该模式的运行。
+纯视觉开关或 `--visual-follow-after-fixed` 开启时强制 `grec=0`，以下安全加强配置行为只适用于这两者均未开启的运行。
 关闭安全加强会恢复原安全策略的逐步干预，不会关闭原安全策略。
 `safety_grec_force_one=False` 保留危险门控、撤回锁存和最小增益逻辑，记录的是原有效增益，
 不是未经处理的 actor 原始动作；撤回/归位期间仍可更新诊断增益，但不会让 arm actor 重新接管。
