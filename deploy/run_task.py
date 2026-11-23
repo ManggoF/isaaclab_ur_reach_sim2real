@@ -107,10 +107,13 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
     VISUAL_ONLY_POSITION_PRIORITY = True  # 仅纯视觉且不带 --visual-follow-after-fixed：勺心位置优先，腕部自由调整。
     VISUAL_ONLY_POSITION_DEADBAND_M = 0.002  # 2mm内停止追逐位置噪声；必须不大于喂入高度容差3mm。
     VISUAL_ONLY_ANGLE_DEADBAND_DEG = 0.5  # 小于喂入姿态门槛1°，避免对准后反复微调。
-    VISUAL_INSERT_DEPTH_M = -0.008  # 嘴平面前 5 mm；比 +0.005 少前送 1 cm，仅改变喂入终点。
+    VISUAL_FEED_AXIS_TOL_DEG = 1.0  # 喂入前：实际勺轴与控制嘴轴、最新视觉嘴轴均须在此误差内。
+    VISUAL_FEED_LATERAL_TOL_M = 0.002  # 喂入前横向对中容差2mm；水平模式的高度仍单独检查。
+    VISUAL_FEED_ALIGN_HOLD_S = 0.3  # 连续对齐至少0.3s且经过至少3帧新视觉数据，才允许喂入。
+    VISUAL_INSERT_DEPTH_M = -0.008  # 嘴平面前8mm；仅改变喂入终点。
     VISUAL_INSERT_DEPTH_MIN_M = -0.020  # 允许终点位于视觉嘴平面前最多 2 cm，便于缩短前送。
     VISUAL_INSERT_DEPTH_MAX_M = 0.080  # 最大 8 cm，配合至少 10 cm 撤回，退出嘴平面后再归位。
-    VISUAL_FEED_LOCKED_MODE = True  # 张嘴对准后锁定喂入，忽略后续视觉遮挡/闭嘴/头部位移；保留力觉和机器人反馈保护。
+    VISUAL_FEED_LOCKED_MODE = True  # 张嘴对准后锁定喂入，忽略后续视觉遮挡/闭嘴/头部位移；力觉仅记录，保留机器人反馈和轨迹保护。
     # [向嘴内/向前, 向本人左侧, 向上]；负值分别为向外、本人右侧、向下。
     # 保持全零；深度不足只修改 VISUAL_INSERT_DEPTH_M，不移动视觉跟随等待位置。
     VISUAL_TARGET_OFFSET_M = (0.00, 0.00, 0.00)
@@ -389,7 +392,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
             )
             self.get_logger().info(
                 "视觉跟随模式：有效/记录 grec 始终为 0，禁用原安全层撤回及安全加强触发；"
-                "保留正常成功撤回，以及力/力矩、机器人反馈和实际轨迹保护。"
+                "力/力矩超限仅记录，不触发视觉喂入/保持阶段提前撤回；保留正常成功撤回、机器人反馈和实际轨迹保护。"
             )
             if self.visual_follow_config.locked_feed:
                 self.get_logger().info(
@@ -425,7 +428,7 @@ class ArmPolicyDeployNode(VisualMouthFollowMixin, Node):
                 f"ramp={self.RESET_ACTION_RAMP_STEPS} steps"
             )
         if self.visual_only_mode:
-            self.get_logger().info("纯视觉控制：视觉误差经 IK 转为关节轨迹；gslow/glat/grec 均为 0，保留独立力觉与运动约束。")
+            self.get_logger().info("纯视觉控制：视觉误差经 IK 转为关节轨迹；gslow/glat/grec 均为 0，力觉仅用于诊断记录，保留运动约束。")
         elif self.rule_safety_enabled:
             self.get_logger().info(
                 "规则安全层已启用: "

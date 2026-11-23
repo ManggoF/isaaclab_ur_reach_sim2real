@@ -280,7 +280,7 @@ class VisualMouthFollowTest(unittest.TestCase):
         self.assertEqual(node.fsm_state, 'VISUAL_TRACK')
 
     def test_closed_or_lost_visual_or_head_motion_aborts_into_withdrawal(self):
-        for failure in ('closed', 'lost', 'moved', 'jump', 'force', 'timeout'):
+        for failure in ('closed', 'lost', 'moved', 'jump', 'timeout'):
             with self.subTest(failure=failure):
                 node = HybridNode(locked_feed=False)
                 node.reach_feeding()
@@ -295,9 +295,6 @@ class VisualMouthFollowTest(unittest.TestCase):
                     node.send_sample(position=node.live_mouth + [0., 0., 0.10])
                 elif failure == 'timeout':
                     node.visual_feed_start_ns -= 16_000_000_000
-                    node.send_sample()
-                else:
-                    node.get_sim_aligned_safety_wrench_raw.return_value = np.array([20., 0., 0., 0., 0., 0.])
                     node.send_sample()
                 node.tick()
                 self.assertEqual(node.fsm_state, 'SAFETY_WITHDRAW')
@@ -470,7 +467,7 @@ class VisualMouthFollowTest(unittest.TestCase):
                     self.assertTrue(np.all(np.abs(p.velocities) <= node.JOINT_MAX_VELOCITIES_RAD_S + 1e-9))
 
     def test_loss_after_dispatch_interrupts_continuous_feed(self):
-        for failure in ('closed', 'lost', 'force'):
+        for failure in ('closed', 'lost'):
             with self.subTest(failure=failure):
                 node = HybridNode(locked_feed=False)
                 node.safety_grec_force_one = True
@@ -484,9 +481,6 @@ class VisualMouthFollowTest(unittest.TestCase):
                     node.send_sample(gap_mm=5.)
                 elif failure == 'lost':
                     node.now_ns += 500_000_000
-                else:
-                    node.get_sim_aligned_safety_wrench_raw.return_value = np.array([20., 0., 0., 0., 0., 0.])
-                    node.send_sample()
                 node.tick()
                 self.assertEqual(node.fsm_state, 'SAFETY_WITHDRAW')
                 self.assertEqual(len(node.trajectories), 2)
@@ -577,8 +571,10 @@ class VisualMouthFollowTest(unittest.TestCase):
         self.assertAlmostEqual(node.withdraw_distance_m, 0.10)
         self.assertTrue(all(row['grec'] == 0. for row in node.safety_gain_curve_rows))
 
-    def test_locked_feed_keeps_force_abort_when_vision_is_stale(self):
+    def test_locked_feed_records_force_without_withdrawal_when_vision_is_stale(self):
         node = HybridNode()
+        node.visual_only_mode = True
+        node.wrist_wrench_policy_obs = np.zeros(6)
         node.follow_commands = False
         node.reach_feeding()
         node.tick()
@@ -586,8 +582,43 @@ class VisualMouthFollowTest(unittest.TestCase):
         node.now_ns += 500_000_000
         node.get_sim_aligned_safety_wrench_raw.return_value = np.array([20., 0., 0., 0., 0., 0.])
         node.tick()
-        self.assertEqual(node.fsm_state, 'SAFETY_WITHDRAW')
-        self.assertEqual(len(node.trajectories), 2)
+        self.assertEqual(node.fsm_state, 'VISUAL_FEED')
+        self.assertEqual(len(node.trajectories), 1)
+        self.assertGreater(node.rule_safety_last_state['force_norm'], node.RULE_FORCE_THRESHOLD_N)
+
+    def test_force_torque_and_axial_limits_do_not_interrupt_visual_feed_or_hold(self):
+        wrenches = ([20., 0., 0., 0., 0., 0.], [0., 0., 0., 3., 0., 0.], [0., 0., 5., 0., 0., 0.])
+        for pure in (False, True):
+            for locked in (False, True):
+                for stage in ('before_dispatch', 'after_dispatch', 'hold'):
+                    with self.subTest(pure=pure, locked=locked, stage=stage):
+                        node = HybridNode(locked_feed=locked)
+                        node.visual_only_mode = pure
+                        node.args.visual_follow_after_fixed = not pure
+                        node.learned_safety_enabled = not pure
+                        node.wrist_wrench_policy_obs = np.zeros(6)
+                        node.safety_policy.act.return_value = np.zeros(3)
+                        node.follow_commands = stage == 'hold'
+                        node.reach_feeding()
+                        if stage == 'after_dispatch':
+                            node.send_sample()
+                            node.tick()
+                        elif stage == 'hold':
+                            for _ in range(30):
+                                node.send_sample()
+                                node.tick()
+                                if node.fsm_state == 'SUCCESS_HOLD':
+                                    break
+                            self.assertEqual(node.fsm_state, 'SUCCESS_HOLD')
+                        for wrench in wrenches:
+                            node.get_sim_aligned_safety_wrench_raw.return_value = np.asarray(wrench)
+                            node.send_sample()
+                            node.tick()
+                            self.assertEqual(node.fsm_state, 'SUCCESS_HOLD' if stage == 'hold' else 'VISUAL_FEED')
+                            self.assertTrue(node.visual_feed_trajectory_sent)
+                            self.assertFalse(node.safety_strengthen_active)
+                            self.assertEqual(len(node.trajectories), 1)
+                            self.assertEqual(node.rule_safety_last_state['grec'], 0.)
 
     def test_negative_depth_stops_before_visual_plane_and_completes_reset(self):
         node = HybridNode()

@@ -37,6 +37,9 @@ class VisualFollowConfig:
     filter_alpha: float = 0.35
     position_deadband: float = 0.002
     angle_deadband_deg: float = 0.5
+    feed_axis_tolerance_deg: float = 1.0
+    feed_lateral_tolerance: float = 0.002
+    feed_align_hold_s: float = 0.3
 
     @classmethod
     def from_args(cls, args, settings):
@@ -52,6 +55,9 @@ class VisualFollowConfig:
             offset = np.asarray(settings.VISUAL_TARGET_OFFSET_M, dtype=np.float64)
             position_deadband = float(settings.VISUAL_ONLY_POSITION_DEADBAND_M)
             angle_deadband = float(settings.VISUAL_ONLY_ANGLE_DEADBAND_DEG)
+            feed_axis_tolerance = float(settings.VISUAL_FEED_AXIS_TOL_DEG)
+            feed_lateral_tolerance = float(settings.VISUAL_FEED_LATERAL_TOL_M)
+            feed_align_hold = float(settings.VISUAL_FEED_ALIGN_HOLD_S)
             valid_depth = (math.isfinite(depth)
                            and settings.VISUAL_INSERT_DEPTH_MIN_M <= depth <= settings.VISUAL_INSERT_DEPTH_MAX_M)
         except (TypeError, ValueError):
@@ -68,9 +74,17 @@ class VisualFollowConfig:
             raise ValueError('run_task.py: VISUAL_ONLY_POSITION_DEADBAND_M 必须在 (0, 0.003]m 内。')
         if not math.isfinite(angle_deadband) or not 0. < angle_deadband <= 1.:
             raise ValueError('run_task.py: VISUAL_ONLY_ANGLE_DEADBAND_DEG 必须在 (0, 1]° 内。')
+        if not math.isfinite(feed_axis_tolerance) or not 0. < feed_axis_tolerance <= 5.:
+            raise ValueError('run_task.py: VISUAL_FEED_AXIS_TOL_DEG 必须在 (0, 5]° 内。')
+        if not math.isfinite(feed_lateral_tolerance) or not 0. < feed_lateral_tolerance <= cls.align_tolerance:
+            raise ValueError('run_task.py: VISUAL_FEED_LATERAL_TOL_M 必须在 (0, 0.008]m 内。')
+        if not math.isfinite(feed_align_hold) or not 0. < feed_align_hold <= 2.:
+            raise ValueError('run_task.py: VISUAL_FEED_ALIGN_HOLD_S 必须在 (0, 2]s 内。')
         return cls(insert_depth=float(depth), target_offset=tuple(map(float, offset)),
                    locked_feed=bool(settings.VISUAL_FEED_LOCKED_MODE),
                    position_deadband=position_deadband, angle_deadband_deg=angle_deadband,
+                   feed_axis_tolerance_deg=feed_axis_tolerance, feed_lateral_tolerance=feed_lateral_tolerance,
+                   feed_align_hold_s=feed_align_hold,
                    **{key: getattr(args, value) for key, value in mapping.items()})
 
 
@@ -102,7 +116,7 @@ class VisualMouthFollowMixin:
         self.visual_last_open_sample_ns = None
         self.visual_open_samples = 0
         self.visual_open = False
-        self.visual_aligned_steps = 0
+        self.reset_visual_alignment()
         self.visual_feed_stable_steps = 0
         self.visual_feed_start_ns = None
         self.visual_feed_trajectory_planned = False
@@ -173,6 +187,12 @@ class VisualMouthFollowMixin:
         if depth is None:
             depth = self.visual_follow_config.insert_depth
         target = self.visual_feed_mouth + self.visual_feed_axis * depth
+        if self.visual_feed_start_spoon is not None:
+            # Finish centering BEFORE feeding. Preserve the small accepted lateral
+            # offset instead of drawing an oblique line back to the mouth center.
+            start = self.visual_feed_start_spoon
+            start_depth = float((start - self.visual_feed_mouth) @ self.visual_feed_axis)
+            target = start + self.visual_feed_axis * (depth - start_depth)
         if self.visual_follow_config.horizontal:
             target[2] = self.visual_feed_height
         return target
@@ -261,7 +281,50 @@ class VisualMouthFollowMixin:
         self.visual_open_since_ns = None
         self.visual_last_open_sample_ns = None
         self.visual_open_samples = 0
+        self.reset_visual_alignment()
+
+    def reset_visual_alignment(self):
         self.visual_aligned_steps = 0
+        self.visual_align_since_ns = None
+        self.visual_align_first_stamp_ns = None
+        self.visual_align_last_stamp_ns = None
+        self.visual_align_samples = 0
+
+    def update_visual_alignment(self, aligned):
+        """Require sustained measured alignment, confirmed by distinct vision frames."""
+        if not aligned:
+            self.reset_visual_alignment()
+            return False
+        now = self.get_clock().now().nanoseconds
+        stamp = self.visual_pose_stamp_ns
+        if self.visual_align_since_ns is None:
+            self.visual_align_since_ns = now
+            self.visual_align_first_stamp_ns = stamp
+        self.visual_aligned_steps += 1
+        if stamp != self.visual_align_last_stamp_ns:
+            self.visual_align_last_stamp_ns = stamp
+            self.visual_align_samples += 1
+        hold_ns = round(self.visual_follow_config.feed_align_hold_s * 1e9)
+        return (self.visual_aligned_steps >= 5 and self.visual_align_samples >= 3
+                and now - self.visual_align_since_ns >= hold_ns
+                and stamp - self.visual_align_first_stamp_ns >= hold_ns)
+
+    def visual_axis_alignment(self, spoon, rotation, mouth, axis):
+        """Measure the actual spoon axis and centerline independently of IK goals."""
+        spoon_axis = rotation.apply(self.SPOON_FORWARD_AXIS_LOCAL)
+        angle = math.acos(float(np.clip(np.dot(spoon_axis, axis), -1., 1.)))
+        offset = spoon - mouth
+        lateral = offset - float(offset @ axis) * axis
+        if self.visual_follow_config.horizontal:
+            lateral[2] = 0.  # Height has its own gate and is locked during feeding.
+        return angle, float(np.linalg.norm(lateral))
+
+    def return_to_visual_alignment(self, reason):
+        self.fsm_state = 'VISUAL_TRACK'
+        self.visual_feed_locked = False
+        self.visual_feed_trajectory_planned = False
+        self.visual_last_command_ns = None
+        self.hold_visual_position('喂入尚未下发，重新进行最终对齐: ' + reason)
 
     def visual_opening_ready(self):
         # Both outputs must originate from the SAME camera acquisition, not a held pose.
@@ -387,6 +450,27 @@ class VisualMouthFollowMixin:
     def update_visual_feed_trajectory(self, ee_pos, quat, spoon, target):
         """Dispatch one complete feed and monitor actual arrival, never resend."""
         cfg = self.visual_follow_config
+        if not self.visual_feed_trajectory_planned:
+            actual_rot = R.from_quat(quat[[1, 2, 3, 0]])
+            axis_error, lateral = self.visual_axis_alignment(
+                spoon, actual_rot, self.visual_feed_mouth, self.visual_feed_axis,
+            )
+            pose_error = (R.from_quat(self.visual_feed_quat[[1, 2, 3, 0]]) * actual_rot.inv()).magnitude()
+            if (axis_error > math.radians(cfg.feed_axis_tolerance_deg)
+                    or lateral > cfg.feed_lateral_tolerance
+                    or pose_error > math.radians(1. if cfg.horizontal else cfg.feed_axis_tolerance_deg)
+                    or np.linalg.norm(spoon - self.visual_feed_start_spoon) > cfg.feed_tolerance
+                    or np.max(np.abs(self.current_joint_vel)) >= 0.03):
+                self.return_to_visual_alignment(
+                    f'轴向误差={math.degrees(axis_error):.2f}deg，横向偏差={lateral * 1000.:.1f}mm，检查实际位姿/稳定性'
+                )
+                return
+            # Anchor the axial line to the confirmed pose at dispatch, including
+            # sub-millimeter settling since the preceding alignment callback.
+            self.visual_feed_start_spoon = spoon.copy()
+            self.visual_feed_height = float(spoon[2])
+            self.visual_feed_quat = quat.copy()
+            target = self.visual_feed_target()
         offset = spoon - self.visual_feed_mouth
         depth = float(offset @ self.visual_feed_axis)
         radial = float(np.linalg.norm(offset - depth * self.visual_feed_axis))
@@ -518,13 +602,8 @@ class VisualMouthFollowMixin:
             if (now - self.visual_feed_start_ns) * 1e-9 > self.visual_feed_timeout_s:
                 self.abort_visual_feed(spoon, quat, "喂入超时")
                 return
-            raw_wrench = self.get_sim_aligned_safety_wrench_raw()
-            axial = abs(float(np.dot(quat_apply_wxyz(quat, raw_wrench[:3]), self.visual_feed_axis)))
-            if (np.linalg.norm(raw_wrench[:3]) > self.RULE_FORCE_THRESHOLD_N
-                    or np.linalg.norm(raw_wrench[3:]) > self.RULE_TORQUE_THRESHOLD_NM
-                    or axial > self.RULE_AXIAL_FORCE_THRESHOLD_N):
-                self.abort_visual_feed(spoon, quat, "喂入期间力/力矩超限")
-                return
+            # Wrench remains part of diagnostics and recording. During visual
+            # feeding/holding, magnitude thresholds do not request withdrawal.
             target = self.visual_feed_target()
             goal_rot = R.from_quat(self.visual_feed_quat[[1, 2, 3, 0]])
         else:
@@ -572,9 +651,31 @@ class VisualMouthFollowMixin:
             stable_open = self.update_visual_open_debounce()
             angle_tolerance = math.radians(1. if cfg.horizontal else 5.)
             height_aligned = not cfg.horizontal or abs(target[2] - spoon[2]) <= cfg.height_tolerance
-            aligned = error <= cfg.align_tolerance and height_aligned and np.linalg.norm(rotation_error) <= angle_tolerance and settled
-            self.visual_aligned_steps = self.visual_aligned_steps + 1 if aligned else 0
-            if stable_open and self.visual_aligned_steps >= 5:
+            axis_error, lateral_error = self.visual_axis_alignment(
+                spoon, current_rot, self.mouth_pos, self.visual_mouth_axis,
+            )
+            # The smoothed tracking axis can lag a turn of the head. A recent
+            # accepted /mouth_pose must independently agree with the actual spoon.
+            latest_axis = self.visual_control_axis(self.visual_raw_axis)
+            latest_axis_error, _ = self.visual_axis_alignment(spoon, current_rot, self.mouth_pos, latest_axis)
+            axis_tolerance = math.radians(cfg.feed_axis_tolerance_deg)
+            aligned = (error <= cfg.align_tolerance and height_aligned and settled
+                       and np.linalg.norm(rotation_error) <= angle_tolerance
+                       and max(axis_error, latest_axis_error) <= axis_tolerance
+                       and lateral_error <= cfg.feed_lateral_tolerance)
+            alignment_confirmed = self.update_visual_alignment(aligned and stable_open)
+            final_alignment = stable_open and error <= cfg.align_tolerance
+            if final_alignment:
+                self.get_logger().info(
+                    f'喂入前最终对齐: axis_error={math.degrees(axis_error):.2f}deg, '
+                    f'latest_axis_error={math.degrees(latest_axis_error):.2f}deg '
+                    f'(limit={cfg.feed_axis_tolerance_deg:.2f}deg), '
+                    f'lateral={lateral_error * 1000.:.1f}/{cfg.feed_lateral_tolerance * 1000.:.1f}mm, '
+                    f'settled={settled}, aligned={aligned}, frames={self.visual_align_samples}, '
+                    f'spoon_axis={np.round(current_rot.apply(self.SPOON_FORWARD_AXIS_LOCAL), 4)}, '
+                    f'mouth_axis={np.round(self.visual_mouth_axis, 4)}', throttle_duration_sec=0.5,
+                )
+            if alignment_confirmed:
                 self.fsm_state = "VISUAL_FEED"
                 self.visual_feed_mouth = self.corrected_visual_mouth().copy()
                 self.visual_feed_start_spoon = spoon.copy()
@@ -584,7 +685,9 @@ class VisualMouthFollowMixin:
                 self.visual_feed_locked = bool(cfg.locked_feed)
                 self.visual_feed_insert_depth = float(cfg.insert_depth)
                 self.visual_feed_height = float(spoon[2])
-                self.visual_feed_quat = goal_rot.as_quat()[[3, 0, 1, 2]] if cfg.horizontal else quat.copy()
+                # Alignment is already complete; preserve the measured pose.
+                # Do not combine the last wrist correction with insertion.
+                self.visual_feed_quat = quat.copy()
                 self.visual_feed_start_ns = now
                 self.visual_feed_stable_steps = 0
                 self.visual_feed_trajectory_planned = False
@@ -592,17 +695,19 @@ class VisualMouthFollowMixin:
                 self.visual_feed_interrupted_reason = ''
                 self.set_visual_safety_target(self.visual_feed_mouth, self.visual_feed_axis)
                 self.get_logger().warn(
-                    f"持续张嘴并已对准，horizontal={cfg.horizontal}, "
+                    f"持续张嘴并已完成最终对齐，axis_error={math.degrees(axis_error):.2f}deg, "
+                    f"lateral={lateral_error * 1000.:.1f}mm, hold={cfg.feed_align_hold_s:.2f}s，horizontal={cfg.horizontal}, "
                     f"喂入锁定高度={self.visual_feed_height:.4f}m，"
                     f"末端目标补偿[前,本人左,上]={np.round(np.asarray(cfg.target_offset) * 1000., 1)}mm，"
                     f"勺心目标相对补偿后嘴平面={cfg.insert_depth * 1000.:+.1f}mm（正内/负外）；"
                     f"locked_feed={self.visual_feed_locked}；"
-                    "将一次下发连续喂入轨迹。"
+                    "将保持当前姿态，沿锁定嘴轴一次下发连续喂入轨迹。"
                 )
                 if self.visual_feed_locked:
                     self.get_logger().info(
                         "本次喂入目标已锁定；后续视觉开口/位姿仅接收，不改变目标或触发中止，"
-                        "到位并保持后沿锁定方向撤回归位；力觉、机器人反馈和轨迹保护继续生效。"
+                        "到位并保持后沿锁定方向撤回归位；力觉继续记录，力/力矩超限不触发撤回，"
+                        "机器人反馈和轨迹保护继续生效。"
                     )
                 return
         elif not (error <= cfg.feed_tolerance and settled):
@@ -634,18 +739,23 @@ class VisualMouthFollowMixin:
         if self.visual_position_priority_enabled():
             error_ik = self.ros_delta_to_ik_delta(np.r_[target - spoon, rotation_error])
             offset_ik = self.ros_delta_to_ik_delta(np.r_[spoon - ee_pos, np.zeros(3)])[:3]
+            position_deadband = cfg.position_deadband
+            angle_deadband = math.radians(cfg.angle_deadband_deg)
+            if final_alignment:
+                position_deadband = min(position_deadband, cfg.feed_lateral_tolerance * 0.5)
+                angle_deadband = min(angle_deadband, math.radians(cfg.feed_axis_tolerance_deg) * 0.5)
             try:
                 joint_target, predicted_delta = self.ik.joint_target_from_spoon_error(
                     self.current_joint_pos, error_ik[:3], error_ik[3:], offset_ik,
                     self.args.max_joint_step, cfg.track_speed * horizon, cfg.angular_speed * horizon,
-                    cfg.position_deadband, math.radians(cfg.angle_deadband_deg),
+                    position_deadband, angle_deadband,
                 )
             except (ValueError, np.linalg.LinAlgError) as exc:
                 self.hold_visual_position(f'纯视觉位置优先 IK 无有效解: {exc}')
                 return
             delta = self.ros_delta_to_ik_delta(predicted_delta)
-            if (not np.any(predicted_delta) and (error > cfg.position_deadband
-                    or np.linalg.norm(rotation_error) > math.radians(cfg.angle_deadband_deg))):
+            if (not np.any(predicted_delta) and (error > position_deadband
+                    or np.linalg.norm(rotation_error) > angle_deadband)):
                 self.get_logger().warn('纯视觉 IK 暂无满足前进和限位条件的解，保持当前位置。', throttle_duration_sec=1.0)
         else:
             joint_target = None
